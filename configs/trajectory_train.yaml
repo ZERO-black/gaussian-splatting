@@ -1,0 +1,66 @@
+model:
+  source_path: ./data/mipnerf360/bicycle
+  model_path: output/bec60fe6-4
+  iteration: -1
+  sh_degree: 3
+  images: images
+  depths: ""
+  resolution: -1
+  white_background: false
+  train_test_exp: false
+  data_device: cuda
+  eval: false
+
+pipeline:
+  convert_SHs_python: false
+  compute_cov3D_python: false
+  debug: false
+  antialiasing: false
+
+uncertainty:
+  enabled: true
+  iteration: -1
+  background: [1.0, 1.0, 1.0]
+
+trajectory:
+  path: ./cameras/random/trajectory.npz
+  key: cubic_trajectory
+  direction_key: null
+  up: [0, -1, 0]
+  camera_split: train
+  reference_camera_index: 0
+
+optimization:
+  iterations: 100
+  translation_lr: 0.005
+  rotation_lr: 0.005
+
+loss:
+  uncertainty_weight: 1e5
+  photometric_weight: 0.0
+  translation_offset_weight: 1.0
+  rotation_offset_weight: 1.0
+  acceleration_weight: 1e3
+
+checkpoint:
+  interval: 25
+  resume: null
+  intermediate_frames: 10
+  fps: 30
+  codec: mp4v
+
+logging:
+  preview_interval: 100
+  wandb:
+    enabled: true
+    project: 3dgs-camera-gradient
+    entity: null
+    name: null
+    mode: online
+
+runtime:
+  device: cuda
+  quiet: false
+
+output:
+  directory: ./output/trajectory_train

@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import math
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -57,6 +58,10 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        # Optional, frozen predictive-uncertainty SH channel loaded from
+        # 3DGS-Uncertainty checkpoints (PLY properties named change_*).
+        self._change_feature = torch.empty(0)
+        self.uncertainty_sh_degree = None
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -124,6 +129,10 @@ class GaussianModel:
     @property
     def get_features_rest(self):
         return self._features_rest
+
+    @property
+    def get_change_feature(self):
+        return self._change_feature
     
     @property
     def get_opacity(self):
@@ -260,8 +269,8 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path, use_train_test_exp = False):
-        plydata = PlyData.read(path)
+    def load_ply(self, path, use_train_test_exp = False, _plydata=None):
+        plydata = PlyData.read(path) if _plydata is None else _plydata
         if use_train_test_exp:
             exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
             if os.path.exists(exposure_file):
@@ -312,6 +321,54 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+
+    def load_ply_uncertainty(self, path, use_train_test_exp=False):
+        """Load a frozen uncertainty SH channel from an augmented 3DGS PLY.
+
+        The checkpoint contains the regular Gaussian properties plus one scalar
+        SH channel stored as ``change_0``, ``change_1``, ... . Unlike the
+        uncertainty-training repository, this project only consumes the fitted
+        channel, so it is deliberately kept as a non-trainable tensor.
+        """
+        plydata = PlyData.read(path)
+        self.load_ply(path, use_train_test_exp, _plydata=plydata)
+        change_names = [
+            prop.name
+            for prop in plydata.elements[0].properties
+            if prop.name.startswith("change_")
+        ]
+        change_names = sorted(change_names, key=lambda name: int(name.split("_")[-1]))
+        if not change_names:
+            raise ValueError(
+                f"Uncertainty checkpoint has no change_* properties: {path}"
+            )
+
+        expected_names = [f"change_{index}" for index in range(len(change_names))]
+        if change_names != expected_names:
+            raise ValueError(
+                "Uncertainty properties must be contiguous and zero-indexed; "
+                f"found {change_names}"
+            )
+
+        num_coefficients = len(change_names)
+        degree = math.isqrt(num_coefficients) - 1
+        if (degree + 1) ** 2 != num_coefficients:
+            raise ValueError(
+                "The number of uncertainty SH coefficients must be a perfect "
+                f"square, got {num_coefficients}"
+            )
+
+        change_feature = np.stack(
+            [np.asarray(plydata.elements[0][name]) for name in change_names],
+            axis=1,
+        )
+        self._change_feature = (
+            torch.tensor(change_feature, dtype=torch.float, device="cuda")
+            .unsqueeze(-1)
+            .contiguous()
+            .requires_grad_(False)
+        )
+        self.uncertainty_sh_degree = degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
