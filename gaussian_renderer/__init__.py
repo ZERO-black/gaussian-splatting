@@ -15,6 +15,19 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
+
+def knn_colormap(values, value_min, value_max):
+    """Map normalized KNN scalars to blue-cyan-yellow-red RGB on CUDA."""
+    values = values.reshape(-1)
+    value_min = torch.as_tensor(value_min, dtype=values.dtype, device=values.device)
+    value_max = torch.as_tensor(value_max, dtype=values.dtype, device=values.device)
+    denominator = torch.clamp_min(value_max - value_min, torch.finfo(values.dtype).eps)
+    normalized = torch.clamp((values - value_min) / denominator, 0.0, 1.0)
+    red = torch.clamp(1.5 - torch.abs(4.0 * normalized - 3.0), 0.0, 1.0)
+    green = torch.clamp(1.5 - torch.abs(4.0 * normalized - 2.0), 0.0, 1.0)
+    blue = torch.clamp(1.5 - torch.abs(4.0 * normalized - 1.0), 0.0, 1.0)
+    return torch.stack((red, green, blue), dim=1)
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
     Render the scene. 
@@ -71,6 +84,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
     colors_precomp = None
+    use_separate_sh = separate_sh and override_color is None
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
@@ -79,7 +93,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
-            if separate_sh:
+            if use_separate_sh:
                 dc, shs = pc.get_features_dc, pc.get_features_rest
             else:
                 shs = pc.get_features
@@ -87,7 +101,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    if separate_sh:
+    if use_separate_sh:
         rendered_image, radii, depth_image = rasterizer(
             means3D = means3D,
             means2D = means2D,

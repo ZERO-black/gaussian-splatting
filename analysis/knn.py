@@ -7,6 +7,8 @@ Gaussian in the trained model.
 import argparse
 import csv
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +65,18 @@ def parse_args():
     parser.add_argument(
         "--replot-only", action="store_true",
         help="Regenerate histograms from existing knn_metrics.npz without recomputing KNN.",
+    )
+    parser.add_argument(
+        "--export-ply-only", action="store_true",
+        help="Add saved K-th-distance metrics to a PLY without recomputing KNN.",
+    )
+    parser.add_argument(
+        "--annotated-ply", type=Path,
+        help="Annotated PLY path (default: <output-dir>/point_cloud_knn.ply).",
+    )
+    parser.add_argument(
+        "--skip-annotated-ply", action="store_true",
+        help="Do not write the Gaussian PLY containing knn_k<K> properties.",
     )
     parser.add_argument(
         "-o", "--output-dir", type=Path,
@@ -267,6 +281,106 @@ def save_outliers(
     return int(indices.size)
 
 
+def annotated_ply_path(args, output_dir):
+    return (args.annotated_ply or (output_dir / "point_cloud_knn.ply")).expanduser().resolve()
+
+
+def write_annotated_ply(input_path, output_path, properties, chunk_size=100_000):
+    """Copy a 3DGS PLY and append aligned float properties to every vertex."""
+    from plyfile import PlyData, PlyElement
+
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError("Annotated PLY must not overwrite the trained input PLY")
+    ply = PlyData.read(str(input_path), mmap="r")
+    if not ply.elements or ply.elements[0].name != "vertex":
+        raise ValueError("PLY has no leading vertex element: {}".format(input_path))
+    vertex = ply.elements[0]
+    source = vertex.data
+    point_count = len(source)
+    existing = set(source.dtype.names)
+    for name, values in properties.items():
+        if name in existing:
+            raise ValueError("PLY already contains property {!r}".format(name))
+        if values.shape != (point_count,):
+            raise ValueError(
+                "{} has shape {}; expected ({},)".format(name, values.shape, point_count)
+            )
+        if not np.isfinite(values).all():
+            raise ValueError("{} contains non-finite values".format(name))
+
+    scalar_dtype = source.dtype.fields["x"][0]
+    annotated_dtype = np.dtype(
+        source.dtype.descr + [(name, scalar_dtype) for name in properties]
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile(
+        prefix=".knn_ply_", suffix=".tmp", dir=str(output_path.parent), delete=False
+    )
+    temp_path = Path(temp.name)
+    temp.close()
+    annotated = None
+    try:
+        annotated = np.memmap(
+            str(temp_path), dtype=annotated_dtype, mode="w+", shape=(point_count,)
+        )
+        source_bytes = source.view(np.uint8).reshape(point_count, source.dtype.itemsize)
+        annotated_bytes = annotated.view(np.uint8).reshape(
+            point_count, annotated_dtype.itemsize
+        )
+        for start in range(0, point_count, chunk_size):
+            end = min(start + chunk_size, point_count)
+            annotated_bytes[start:end, :source.dtype.itemsize] = source_bytes[start:end]
+            for name, values in properties.items():
+                annotated[name][start:end] = values[start:end]
+            print(
+                "PLY export: {:,}/{:,} Gaussians".format(end, point_count),
+                end="\r", flush=True,
+            )
+        print()
+        annotated.flush()
+        annotated_vertex = PlyElement.describe(annotated, vertex.name)
+        comments = list(ply.comments)
+        for name in properties:
+            comments.append(
+                "{}: raw Euclidean distance to the K-th nearest Gaussian".format(name)
+            )
+        PlyData(
+            [annotated_vertex] + list(ply.elements[1:]),
+            text=ply.text,
+            byte_order=ply.byte_order,
+            comments=comments,
+            obj_info=list(ply.obj_info),
+        ).write(str(output_path))
+    finally:
+        if annotated is not None:
+            del annotated
+        if temp_path.exists():
+            os.unlink(str(temp_path))
+    print("Annotated Gaussian PLY written to {}".format(output_path))
+
+
+def export_saved_metrics(ply_path, output_dir, args):
+    metrics_path = output_dir / "knn_metrics.npz"
+    summary_path = output_dir / "summary.json"
+    if not metrics_path.is_file() or not summary_path.is_file():
+        raise FileNotFoundError(
+            "--export-ply-only requires knn_metrics.npz and summary.json in {}".format(
+                output_dir
+            )
+        )
+    with summary_path.open() as stream:
+        summary = json.load(stream)
+    with np.load(str(metrics_path)) as arrays:
+        properties = {
+            "knn_k{}".format(k): arrays["kth_distance_k{}".format(k)]
+            for k in summary["k_values"]
+        }
+        write_annotated_ply(
+            ply_path, annotated_ply_path(args, output_dir), properties,
+            args.query_batch_size,
+        )
+
+
 def validate_args(args):
     k_values = sorted(set(args.k))
     if not k_values or any(k <= 0 for k in k_values):
@@ -281,6 +395,10 @@ def validate_args(args):
         raise ValueError("--bins and --query-batch-size must be positive")
     if args.workers == 0 or args.workers < -1:
         raise ValueError("--workers must be -1 or a positive integer")
+    if args.replot_only and args.export_ply_only:
+        raise ValueError("--replot-only and --export-ply-only are mutually exclusive")
+    if args.skip_annotated_ply and args.export_ply_only:
+        raise ValueError("--skip-annotated-ply cannot be used with --export-ply-only")
     return k_values
 
 
@@ -315,6 +433,9 @@ def main():
     if args.replot_only:
         replot_existing(output_dir, args)
         return
+    if args.export_ply_only:
+        export_saved_metrics(ply_path, output_dir, args)
+        return
     print("Loading Gaussian centers from {}".format(ply_path))
     centers = load_gaussian_centers(ply_path)
     print("Loaded {:,} centers; computing exact KNN for K={}".format(
@@ -334,6 +455,7 @@ def main():
         "self_neighbor_excluded": True,
         "tail_percentile": args.tail_percentile,
         "hist_max_percentile": args.hist_max_percentile,
+        "ply_properties": {"{}".format(k): "knn_k{}".format(k) for k in k_values},
         "metrics": {},
     }
     arrays = {"index": np.arange(centers.shape[0], dtype=np.int64)}
@@ -369,6 +491,13 @@ def main():
     np.savez_compressed(str(output_dir / "knn_metrics.npz"), **arrays)
     with (output_dir / "summary.json").open("w") as stream:
         json.dump(summary, stream, indent=2)
+    if not args.skip_annotated_ply:
+        write_annotated_ply(
+            ply_path,
+            annotated_ply_path(args, output_dir),
+            {"knn_k{}".format(k): metrics[k][1] for k in k_values},
+            args.query_batch_size,
+        )
     print("Analysis written to {}".format(output_dir))
 
 
