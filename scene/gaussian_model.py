@@ -59,6 +59,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._knn = {}
+        self._knn_metrics = {}
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -148,6 +149,24 @@ class GaussianModel:
             )
         return self._knn[k]
 
+    @property
+    def available_knn_metrics(self):
+        return sorted(self._knn_metrics)
+
+    def get_knn_metric(self, property_name):
+        """Return an annotated scalar by its exact PLY property name."""
+        if property_name.startswith("knn_k") and property_name[5:].isdigit():
+            return self.get_knn(int(property_name[5:]))
+        if property_name not in self._knn_metrics:
+            raise KeyError(
+                "KNN property {!r} is unavailable; loaded properties: {}".format(
+                    property_name,
+                    ["knn_k{}".format(k) for k in self.available_knn_k]
+                    + self.available_knn_metrics,
+                )
+            )
+        return self._knn_metrics[property_name]
+
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
             return self._exposure[self.exposure_mapping[image_name]]
@@ -185,6 +204,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._knn = {}
+        self._knn_metrics = {}
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
@@ -252,6 +272,7 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         for k in self.available_knn_k:
             l.append('knn_k{}'.format(k))
+        l.extend(self.available_knn_metrics)
         return l
 
     def save_ply(self, path):
@@ -268,6 +289,10 @@ class GaussianModel:
             self._knn[k].detach().cpu().numpy().reshape(-1, 1)
             for k in self.available_knn_k
         ]
+        knn_values.extend(
+            self._knn_metrics[name].detach().cpu().numpy().reshape(-1, 1)
+            for name in self.available_knn_metrics
+        )
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
@@ -328,11 +353,16 @@ class GaussianModel:
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         knn_properties = {}
+        knn_metrics = {}
         for prop in plydata.elements[0].properties:
             match = re.fullmatch(r"knn_k(\d+)", prop.name)
             if match:
                 k = int(match.group(1))
                 knn_properties[k] = np.asarray(
+                    plydata.elements[0][prop.name], dtype=np.float32
+                )[..., np.newaxis]
+            elif prop.name.startswith("knn_"):
+                knn_metrics[prop.name] = np.asarray(
                     plydata.elements[0][prop.name], dtype=np.float32
                 )[..., np.newaxis]
 
@@ -345,6 +375,10 @@ class GaussianModel:
         self._knn = {
             k: torch.tensor(values, dtype=torch.float, device="cuda")
             for k, values in knn_properties.items()
+        }
+        self._knn_metrics = {
+            name: torch.tensor(values, dtype=torch.float, device="cuda")
+            for name, values in knn_metrics.items()
         }
 
         self.active_sh_degree = self.max_sh_degree

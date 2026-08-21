@@ -54,6 +54,15 @@ def create_window(window_size, channel):
     return window
 
 def ssim(img1, img2, window_size=11, size_average=True):
+    ssim_values = ssim_map(img1, img2, window_size)
+
+    if size_average:
+        return ssim_values.mean()
+    else:
+        return ssim_values.mean(1).mean(1).mean(1)
+
+def ssim_map(img1, img2, window_size=11):
+    """Return the per-channel spatial SSIM map used by :func:`ssim`."""
     channel = img1.size(-3)
     window = create_window(window_size, channel)
 
@@ -61,9 +70,17 @@ def ssim(img1, img2, window_size=11, size_average=True):
         window = window.cuda(img1.get_device())
     window = window.type_as(img1)
 
-    return _ssim(img1, img2, window, window_size, channel, size_average)
+    return _ssim_map(img1, img2, window, window_size, channel)
 
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
+    ssim_values = _ssim_map(img1, img2, window, window_size, channel)
+
+    if size_average:
+        return ssim_values.mean()
+    else:
+        return ssim_values.mean(1).mean(1).mean(1)
+
+def _ssim_map(img1, img2, window, window_size, channel):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
 
@@ -78,12 +95,7 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
 
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-
-    if size_average:
-        return ssim_map.mean()
-    else:
-        return ssim_map.mean(1).mean(1).mean(1)
+    return ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
 
 def fast_ssim(img1, img2):

@@ -18,6 +18,7 @@ from os import makedirs
 from gaussian_renderer import render, knn_colormap
 import torchvision
 from utils.general_utils import safe_state
+from utils.system_utils import searchForMaxIteration
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
@@ -28,9 +29,9 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def render_comparison_set(
+def render_analysis_set(
     model_path, name, iteration, views, gaussians, pipeline, background,
-    train_test_exp, separate_sh, knn_colors, render_label,
+    train_test_exp, separate_sh, analysis_colors, render_label,
     visualization_metadata,
 ):
     base_path = os.path.join(model_path, name, "ours_{}".format(iteration))
@@ -50,46 +51,105 @@ def render_comparison_set(
             colorbar, os.path.join(visualization_path, "colormap.png")
         )
 
-    for idx, view in enumerate(tqdm(views, desc="RGB + KNN rendering progress")):
-        rgb_rendering = render(
-            view, gaussians, pipeline, background,
-            use_trained_exp=train_test_exp,
-            separate_sh=separate_sh,
-        )["render"]
-        knn_rendering = render(
+    for idx, view in enumerate(tqdm(views, desc="KNN analysis rendering progress")):
+        analysis_rendering = render(
             view, gaussians, pipeline, background,
             use_trained_exp=False,
             separate_sh=separate_sh,
-            override_color=knn_colors,
+            override_color=analysis_colors,
         )["render"]
 
         if train_test_exp:
-            rgb_rendering = rgb_rendering[..., rgb_rendering.shape[-1] // 2:]
-            knn_rendering = knn_rendering[..., knn_rendering.shape[-1] // 2:]
+            analysis_rendering = analysis_rendering[
+                ..., analysis_rendering.shape[-1] // 2:
+            ]
 
-        comparison = torch.cat((rgb_rendering, knn_rendering), dim=-1)
         torchvision.utils.save_image(
-            comparison, os.path.join(render_path, "{0:05d}.png".format(idx))
+            analysis_rendering, os.path.join(render_path, "{0:05d}.png".format(idx))
         )
 
 
-def prepare_knn_colors(
-    gaussians, k, percentile_min, percentile_max, value_min=None, value_max=None
-):
-    values = gaussians.get_knn(k).reshape(-1)
-    if not torch.isfinite(values).all():
-        raise ValueError("knn_k{} contains non-finite values".format(k))
+def _kth_distance(gaussians, k):
+    return gaussians.get_knn(k).reshape(-1)
 
-    lower = (
-        float(value_min)
-        if value_min is not None
-        else float(torch.quantile(values, percentile_min / 100.0).item())
-    )
-    upper = (
-        float(value_max)
-        if value_max is not None
-        else float(torch.quantile(values, percentile_max / 100.0).item())
-    )
+
+def _mean_distance(gaussians, k):
+    return gaussians.get_knn_metric("knn_mean_k{}".format(k)).reshape(-1)
+
+
+def _max_scale(gaussians):
+    return torch.max(gaussians.get_scaling, dim=1).values
+
+
+def _mean_scale(gaussians):
+    return torch.mean(gaussians.get_scaling, dim=1)
+
+
+def _mean_over_max_scale(gaussians, k):
+    return _mean_distance(gaussians, k) / _max_scale(gaussians)
+
+
+def _kth_over_max_scale(gaussians, k):
+    return _kth_distance(gaussians, k) / _max_scale(gaussians)
+
+
+def _mean_over_mean_scale(gaussians, k):
+    return _mean_distance(gaussians, k) / _mean_scale(gaussians)
+
+
+def _kth_over_mean_scale(gaussians, k):
+    return _kth_distance(gaussians, k) / _mean_scale(gaussians)
+
+
+# Add a metric by defining one function with this signature and registering it here.
+METRIC_FUNCTIONS = {
+    "kth": _kth_distance,
+    "mean": _mean_distance,
+    "kth_over_max_scale": _kth_over_max_scale,
+    "mean_over_max_scale": _mean_over_max_scale,
+    "kth_over_mean_scale": _kth_over_mean_scale,
+    "mean_over_mean_scale": _mean_over_mean_scale,
+}
+
+METRIC_DESCRIPTIONS = {
+    "kth": "raw Euclidean distance to the K-th nearest Gaussian",
+    "mean": "mean raw Euclidean distance to the K nearest Gaussians",
+    "kth_over_max_scale": "K-th distance divided by the longest Gaussian scale axis",
+    "mean_over_max_scale": "mean KNN distance divided by the longest Gaussian scale axis",
+    "kth_over_mean_scale": "K-th distance divided by the mean Gaussian scale axis",
+    "mean_over_mean_scale": "mean KNN distance divided by the mean Gaussian scale axis",
+}
+
+
+def prepare_analysis_colors(
+    gaussians, metric, k, percentile_min, percentile_max,
+    value_min=None, value_max=None,
+):
+    values = METRIC_FUNCTIONS[metric](gaussians, k)
+    if not torch.isfinite(values).all():
+        raise ValueError("{} at K={} contains non-finite values".format(metric, k))
+
+    requested_percentiles = []
+    if value_min is None:
+        requested_percentiles.append(percentile_min / 100.0)
+    if value_max is None:
+        requested_percentiles.append(percentile_max / 100.0)
+    percentile_values = []
+    if requested_percentiles:
+        quantiles = torch.tensor(
+            requested_percentiles, dtype=values.dtype, device=values.device
+        )
+        percentile_values = torch.quantile(values, quantiles).tolist()
+    percentile_index = 0
+    if value_min is None:
+        lower = float(percentile_values[percentile_index])
+        percentile_index += 1
+    else:
+        lower = float(value_min)
+    if value_max is None:
+        upper = float(percentile_values[percentile_index])
+    else:
+        upper = float(value_max)
     if upper <= lower:
         raise ValueError(
             "KNN visualization maximum ({}) must be greater than minimum ({})".format(
@@ -98,8 +158,9 @@ def prepare_knn_colors(
         )
     colors = knn_colormap(values, lower, upper)
     metadata = {
-        "property": "knn_k{}".format(k),
-        "statistic": "raw Euclidean distance to the K-th nearest Gaussian",
+        "metric": metric,
+        "k": k,
+        "statistic": METRIC_DESCRIPTIONS[metric],
         "normalization_min": lower,
         "normalization_max": upper,
         "percentile_min": None if value_min is not None else percentile_min,
@@ -114,18 +175,20 @@ def prepare_knn_colors(
 def render_sets(
     dataset : ModelParams, iteration : int, pipeline : PipelineParams,
     skip_train : bool, skip_test : bool, separate_sh: bool,
-    knn_ply=None, knn_k=5,
+    knn_ply=None, knn_k=5, metrics=None, output_label=None,
     knn_percentile_min=1.0, knn_percentile_max=99.5,
     knn_min=None, knn_max=None,
 ):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-
+        loaded_iteration = iteration
+        if loaded_iteration == -1:
+            loaded_iteration = searchForMaxIteration(
+                os.path.join(dataset.model_path, "point_cloud")
+            )
         if knn_ply is None:
             knn_ply = os.path.join(
                 dataset.model_path, "knn_analysis",
-                "iteration_{}".format(scene.loaded_iter), "point_cloud_knn.ply",
+                "iteration_{}".format(loaded_iteration), "point_cloud_knn.ply",
             )
         knn_ply = os.path.abspath(knn_ply)
         if not os.path.isfile(knn_ply):
@@ -134,40 +197,49 @@ def render_sets(
                     knn_ply
                 )
             )
-        gaussians.load_ply(knn_ply, dataset.train_test_exp)
-        knn_colors, visualization_metadata = prepare_knn_colors(
-            gaussians, knn_k, knn_percentile_min, knn_percentile_max,
-            knn_min, knn_max,
-        )
-        render_label = "knn_k{}_comparison".format(knn_k)
-        visualization_metadata["input_ply"] = knn_ply
-        visualization_metadata["layout"] = "left: RGB, right: KNN"
-        print(
-            "RGB + KNN comparison: knn_k{}, range [{:.6g}, {:.6g}], blue -> red".format(
-                knn_k,
-                visualization_metadata["normalization_min"],
-                visualization_metadata["normalization_max"],
-            )
+
+        gaussians = GaussianModel(dataset.sh_degree)
+        scene = Scene(
+            dataset, gaussians, load_iteration=loaded_iteration, shuffle=False,
+            load_ply_path=knn_ply,
         )
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        if not skip_train:
-            render_comparison_set(
-                dataset.model_path, "train", scene.loaded_iter,
-                scene.getTrainCameras(), gaussians, pipeline, background,
-                dataset.train_test_exp, separate_sh, knn_colors, render_label,
-                visualization_metadata,
+        metrics = list(METRIC_FUNCTIONS) if metrics is None else metrics
+        for metric in metrics:
+            analysis_colors, visualization_metadata = prepare_analysis_colors(
+                gaussians, metric, knn_k,
+                knn_percentile_min, knn_percentile_max, knn_min, knn_max,
+            )
+            render_label = output_label or "knn_{}_k{}".format(metric, knn_k)
+            visualization_metadata["input_ply"] = knn_ply
+            visualization_metadata["render_folder"] = render_label
+            print(
+                "KNN analysis: {} (K={}), range [{:.6g}, {:.6g}], blue -> red".format(
+                    metric, knn_k,
+                    visualization_metadata["normalization_min"],
+                    visualization_metadata["normalization_max"],
+                )
             )
 
-        if not skip_test:
-            render_comparison_set(
-                dataset.model_path, "test", scene.loaded_iter,
-                scene.getTestCameras(), gaussians, pipeline, background,
-                dataset.train_test_exp, separate_sh, knn_colors, render_label,
-                visualization_metadata,
-            )
+            if not skip_train:
+                render_analysis_set(
+                    dataset.model_path, "train", scene.loaded_iter,
+                    scene.getTrainCameras(), gaussians, pipeline, background,
+                    dataset.train_test_exp, separate_sh, analysis_colors,
+                    render_label, visualization_metadata,
+                )
+
+            if not skip_test:
+                render_analysis_set(
+                    dataset.model_path, "test", scene.loaded_iter,
+                    scene.getTestCameras(), gaussians, pipeline, background,
+                    dataset.train_test_exp, separate_sh, analysis_colors,
+                    render_label, visualization_metadata,
+                )
+            del analysis_colors
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -184,6 +256,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--knn_k", type=int, default=5, help="KNN property K to render.")
     parser.add_argument(
+        "--metrics", nargs="+", choices=sorted(METRIC_FUNCTIONS), default=None,
+        help="Metrics to render in one run; omitted means all metrics.",
+    )
+    parser.add_argument(
+        "--metric", choices=sorted(METRIC_FUNCTIONS), default=None,
+        help="Deprecated single-metric alias retained for compatibility.",
+    )
+    parser.add_argument(
+        "--output_label", type=str, default=None,
+        help="Optional output folder name; defaults to knn_<metric>_k<K>.",
+    )
+    parser.add_argument(
         "--knn_percentile_min", type=float, default=1.0,
         help="Lower normalization percentile (default: 1).",
     )
@@ -193,17 +277,27 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--knn_min", type=float, default=None,
-        help="Optional fixed raw-distance normalization minimum.",
+        help="Optional fixed selected-metric normalization minimum.",
     )
     parser.add_argument(
         "--knn_max", type=float, default=None,
-        help="Optional fixed raw-distance normalization maximum.",
+        help="Optional fixed selected-metric normalization maximum.",
     )
     args = get_combined_args(parser)
     knn_ply = getattr(args, "knn_ply", None)
     knn_min = getattr(args, "knn_min", None)
     knn_max = getattr(args, "knn_max", None)
-    print("Rendering RGB + KNN comparison for " + args.model_path)
+    output_label = getattr(args, "output_label", None)
+    metrics = getattr(args, "metrics", None)
+    legacy_metric = getattr(args, "metric", None)
+    if metrics is not None and legacy_metric is not None:
+        raise ValueError("Use either --metrics or --metric, not both")
+    if metrics is None:
+        metrics = [legacy_metric] if legacy_metric is not None else list(METRIC_FUNCTIONS)
+    metrics = list(dict.fromkeys(metrics))
+    if output_label is not None and len(metrics) != 1:
+        raise ValueError("--output_label can only be used when rendering one metric")
+    print("Rendering KNN analysis for " + args.model_path)
     if args.knn_k <= 0:
         raise ValueError("--knn_k must be positive")
     if not 0 <= args.knn_percentile_min < args.knn_percentile_max <= 100:
@@ -220,7 +314,7 @@ if __name__ == "__main__":
     render_sets(
         model.extract(args), args.iteration, pipeline.extract(args),
         args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE,
-        knn_ply, args.knn_k,
+        knn_ply, args.knn_k, metrics, output_label,
         args.knn_percentile_min, args.knn_percentile_max,
         knn_min, knn_max,
     )
