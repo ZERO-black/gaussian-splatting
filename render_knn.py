@@ -101,6 +101,20 @@ def _kth_over_mean_scale(gaussians, k):
     return _kth_distance(gaussians, k) / _mean_scale(gaussians)
 
 
+def _annotated_consistency(gaussians, k, axis):
+    return gaussians.get_knn_metric(
+        "knn_{}_axis_consistency_k{}".format(axis, k)
+    ).reshape(-1)
+
+
+def _long_axis_consistency(gaussians, k):
+    return _annotated_consistency(gaussians, k, "long")
+
+
+def _short_axis_consistency(gaussians, k):
+    return _annotated_consistency(gaussians, k, "short")
+
+
 # Add a metric by defining one function with this signature and registering it here.
 METRIC_FUNCTIONS = {
     "kth": _kth_distance,
@@ -109,6 +123,8 @@ METRIC_FUNCTIONS = {
     "mean_over_max_scale": _mean_over_max_scale,
     "kth_over_mean_scale": _kth_over_mean_scale,
     "mean_over_mean_scale": _mean_over_mean_scale,
+    "long_axis_consistency": _long_axis_consistency,
+    "short_axis_consistency": _short_axis_consistency,
 }
 
 METRIC_DESCRIPTIONS = {
@@ -118,7 +134,24 @@ METRIC_DESCRIPTIONS = {
     "mean_over_max_scale": "mean KNN distance divided by the longest Gaussian scale axis",
     "kth_over_mean_scale": "K-th distance divided by the mean Gaussian scale axis",
     "mean_over_mean_scale": "mean KNN distance divided by the mean Gaussian scale axis",
+    "long_axis_consistency": (
+        "mean absolute cosine similarity of longest covariance axes over KNN"
+    ),
+    "short_axis_consistency": (
+        "mean absolute cosine similarity of shortest covariance axes over KNN"
+    ),
 }
+
+COVARIANCE_METRICS = {"long_axis_consistency", "short_axis_consistency"}
+
+
+def _metric_is_available(gaussians, metric, k):
+    if metric in COVARIANCE_METRICS:
+        property_name = "knn_{}_k{}".format(metric, k)
+        return property_name in gaussians.available_knn_metrics
+    if metric.startswith("mean"):
+        return "knn_mean_k{}".format(k) in gaussians.available_knn_metrics
+    return k in gaussians.available_knn_k
 
 
 def prepare_analysis_colors(
@@ -186,14 +219,24 @@ def render_sets(
                 os.path.join(dataset.model_path, "point_cloud")
             )
         if knn_ply is None:
+            analysis_directory = (
+                "covariance_analysis"
+                if metrics and all(metric in COVARIANCE_METRICS for metric in metrics)
+                else "knn_analysis"
+            )
+            annotated_name = (
+                "point_cloud_covariance.ply"
+                if analysis_directory == "covariance_analysis"
+                else "point_cloud_knn.ply"
+            )
             knn_ply = os.path.join(
-                dataset.model_path, "knn_analysis",
-                "iteration_{}".format(loaded_iteration), "point_cloud_knn.ply",
+                dataset.model_path, analysis_directory,
+                "iteration_{}".format(loaded_iteration), annotated_name,
             )
         knn_ply = os.path.abspath(knn_ply)
         if not os.path.isfile(knn_ply):
             raise FileNotFoundError(
-                "KNN-annotated PLY not found: {}. Run analysis/knn.py first.".format(
+                "Analysis-annotated PLY not found: {}. Run the matching analysis first.".format(
                     knn_ply
                 )
             )
@@ -207,7 +250,15 @@ def render_sets(
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        metrics = list(METRIC_FUNCTIONS) if metrics is None else metrics
+        if metrics is None:
+            metrics = [
+                metric for metric in METRIC_FUNCTIONS
+                if _metric_is_available(gaussians, metric, knn_k)
+            ]
+            if not metrics:
+                raise ValueError(
+                    "No supported analysis properties are available for K={}".format(knn_k)
+                )
         for metric in metrics:
             analysis_colors, visualization_metadata = prepare_analysis_colors(
                 gaussians, metric, knn_k,
@@ -252,7 +303,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--knn_ply", type=str, default=None,
-        help="Annotated PLY; defaults to the analysis output for this iteration.",
+        help="Annotated PLY; defaults to the matching analysis output for this iteration.",
     )
     parser.add_argument("--knn_k", type=int, default=5, help="KNN property K to render.")
     parser.add_argument(
@@ -292,10 +343,11 @@ if __name__ == "__main__":
     legacy_metric = getattr(args, "metric", None)
     if metrics is not None and legacy_metric is not None:
         raise ValueError("Use either --metrics or --metric, not both")
-    if metrics is None:
-        metrics = [legacy_metric] if legacy_metric is not None else list(METRIC_FUNCTIONS)
-    metrics = list(dict.fromkeys(metrics))
-    if output_label is not None and len(metrics) != 1:
+    if metrics is None and legacy_metric is not None:
+        metrics = [legacy_metric]
+    if metrics is not None:
+        metrics = list(dict.fromkeys(metrics))
+    if output_label is not None and (metrics is None or len(metrics) != 1):
         raise ValueError("--output_label can only be used when rendering one metric")
     print("Rendering KNN analysis for " + args.model_path)
     if args.knn_k <= 0:

@@ -125,11 +125,11 @@ def _iteration_from_path(ply_path):
     return -1
 
 
-def resolve_input(args):
+def resolve_input(args, analysis_directory="knn_analysis"):
     if args.ply_path is not None:
         ply_path = args.ply_path.expanduser().resolve()
         iteration = _iteration_from_path(ply_path)
-        default_output = ply_path.parent / "knn_analysis"
+        default_output = ply_path.parent / analysis_directory
     else:
         model_path = args.model_path.expanduser().resolve()
         point_cloud_root = model_path / "point_cloud"
@@ -137,14 +137,14 @@ def resolve_input(args):
         if iteration == -1:
             iteration = _latest_iteration(point_cloud_root)
         ply_path = point_cloud_root / ("iteration_{}".format(iteration)) / "point_cloud.ply"
-        default_output = model_path / "knn_analysis" / ("iteration_{}".format(iteration))
+        default_output = model_path / analysis_directory / ("iteration_{}".format(iteration))
     if not ply_path.is_file():
         raise FileNotFoundError("Trained Gaussian PLY not found: {}".format(ply_path))
     return ply_path, (args.output_dir or default_output).expanduser().resolve(), iteration
 
 
-def load_gaussian_geometry(ply_path):
-    """Read xyz and activated scales without allocating CUDA tensors."""
+def load_gaussian_geometry(ply_path, include_rotations=False):
+    """Read xyz, activated scales, and optionally quaternions without CUDA."""
     try:
         from plyfile import PlyData
     except ImportError as exc:
@@ -158,6 +158,8 @@ def load_gaussian_geometry(ply_path):
     vertex = ply.elements[0]
     available = {prop.name for prop in vertex.properties}
     required = {"x", "y", "z", "scale_0", "scale_1", "scale_2"}
+    if include_rotations:
+        required.update({"rot_0", "rot_1", "rot_2", "rot_3"})
     if not required.issubset(available):
         missing = sorted(required - available)
         raise ValueError("PLY vertex element is missing {}: {}".format(missing, ply_path))
@@ -176,11 +178,20 @@ def load_gaussian_geometry(ply_path):
     scales = np.exp(log_scales)
     if not np.isfinite(scales).all() or np.any(scales <= 0):
         raise ValueError("Found non-finite or non-positive activated Gaussian scales")
-    return centers, scales
+    if not include_rotations:
+        return centers, scales
+    rotations = np.column_stack(
+        (vertex["rot_0"], vertex["rot_1"], vertex["rot_2"], vertex["rot_3"])
+    ).astype(np.float64, copy=False)
+    rotation_norms = np.linalg.norm(rotations, axis=1)
+    if not np.isfinite(rotations).all() or np.any(rotation_norms == 0):
+        raise ValueError("Found non-finite or zero-length Gaussian rotations")
+    rotations = rotations / rotation_norms[:, None]
+    return centers, scales, rotations
 
 
-def compute_knn_metrics(centers, scales, k_values, batch_size, workers):
-    """Compute exact KNN metrics with a tree and bounded query memory."""
+def iter_knn_batches(centers, max_k, batch_size, workers):
+    """Yield the exact neighborhoods used by all center-based KNN analyses."""
     try:
         from scipy.spatial import cKDTree
     except ImportError as exc:
@@ -188,25 +199,52 @@ def compute_knn_metrics(centers, scales, k_values, batch_size, workers):
             "scipy is required for exact configurable-K queries; update the project environment."
         ) from exc
 
-    k_values = sorted(set(k_values))
-    point_count, max_k = centers.shape[0], max(k_values)
+    point_count = centers.shape[0]
     if max_k >= point_count:
         raise ValueError(
-            "Largest K ({}) must be smaller than Gaussian count ({})".format(max_k, point_count)
+            "Largest K ({}) must be smaller than Gaussian count ({})".format(
+                max_k, point_count
+            )
         )
     tree = cKDTree(centers)
+    for start in range(0, point_count, batch_size):
+        end = min(start + batch_size, point_count)
+        try:
+            distances, indices = tree.query(
+                centers[start:end], k=max_k + 1, workers=workers
+            )
+        except TypeError:  # scipy < 1.6
+            distances, indices = tree.query(
+                centers[start:end], k=max_k + 1, n_jobs=workers
+            )
+        query_indices = np.arange(start, end)[:, None]
+        is_self = indices == query_indices
+        # Usually self is column zero. Explicit removal also handles coincident
+        # centers, for which cKDTree does not promise an ordering among ties.
+        rank = np.broadcast_to(np.arange(max_k + 1), indices.shape)
+        non_self_order = np.argsort(
+            np.where(is_self, max_k + 1, rank), axis=1, kind="stable"
+        )[:, :max_k]
+        yield (
+            start,
+            end,
+            np.take_along_axis(distances, non_self_order, axis=1),
+            np.take_along_axis(indices, non_self_order, axis=1),
+        )
+
+
+def compute_knn_metrics(centers, scales, k_values, batch_size, workers):
+    """Compute exact KNN metrics with a tree and bounded query memory."""
+    k_values = sorted(set(k_values))
+    point_count, max_k = centers.shape[0], max(k_values)
     metrics = {k: {
         name: np.empty(point_count, dtype=np.float32) for name in METRIC_LABELS
     } for k in k_values}
     max_scale = np.max(scales, axis=1)
     mean_scale = np.mean(scales, axis=1)
-    for start in range(0, point_count, batch_size):
-        end = min(start + batch_size, point_count)
-        try:
-            distances, _ = tree.query(centers[start:end], k=max_k + 1, workers=workers)
-        except TypeError:  # scipy < 1.6
-            distances, _ = tree.query(centers[start:end], k=max_k + 1, n_jobs=workers)
-        neighbor_distances = distances[:, 1:]  # exclude the query center itself
+    for start, end, neighbor_distances, _ in iter_knn_batches(
+        centers, max_k, batch_size, workers
+    ):
         cumulative = np.cumsum(neighbor_distances, axis=1, dtype=np.float64)
         for k, values in metrics.items():
             mean_distance = cumulative[:, k - 1] / k
