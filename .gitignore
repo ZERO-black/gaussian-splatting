@@ -7,5 +7,5 @@ diff_rasterization/dist
 tensorboard_3d
 screenshots
 data
-models/
+models
 logs/
