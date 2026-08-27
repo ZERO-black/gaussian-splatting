@@ -6,8 +6,10 @@ channels:
   - nvidia
 dependencies:
   - cuda-toolkit=12.4
+  - matplotlib
   - plyfile
   - python=3.8
+  - scipy
   - pip=22.3.1
   - pytorch
   - torchaudio

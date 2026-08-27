@@ -16,18 +16,6 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
 
-def knn_colormap(values, value_min, value_max):
-    """Map normalized KNN scalars to blue-cyan-yellow-red RGB on CUDA."""
-    values = values.reshape(-1)
-    value_min = torch.as_tensor(value_min, dtype=values.dtype, device=values.device)
-    value_max = torch.as_tensor(value_max, dtype=values.dtype, device=values.device)
-    denominator = torch.clamp_min(value_max - value_min, torch.finfo(values.dtype).eps)
-    normalized = torch.clamp((values - value_min) / denominator, 0.0, 1.0)
-    red = torch.clamp(1.5 - torch.abs(4.0 * normalized - 3.0), 0.0, 1.0)
-    green = torch.clamp(1.5 - torch.abs(4.0 * normalized - 2.0), 0.0, 1.0)
-    blue = torch.clamp(1.5 - torch.abs(4.0 * normalized - 1.0), 0.0, 1.0)
-    return torch.stack((red, green, blue), dim=1)
-
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
     Render the scene. 

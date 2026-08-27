@@ -1,5 +1,6 @@
 """Render spatial SSIM maps for matching rendered and ground-truth images."""
 
+import argparse
 import json
 from pathlib import Path
 
@@ -12,14 +13,35 @@ from utils.loss_utils import ssim_map
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
-# Edit these values before running: python3 visualize_ssim.py
-RENDER_DIR = Path("models/bicycle/train/ours_30000/renders")
-GT_DIR = Path("models/bicycle/train/ours_30000/gt")
-OUTPUT_DIR = Path("models/bicycle/train/ours_30000/ssim_dissimilarity/renders")
 
-WINDOW_SIZE = 11
-MAP_MODE = "dissimilarity"  # "dissimilarity" (1 - SSIM) or "ssim"
-DEVICE = "auto"  # "auto", "cuda", or "cpu"
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Render spatial SSIM maps for matching render and GT images."
+    )
+    parser.add_argument("render_dir", type=Path, help="Rendered image directory.")
+    parser.add_argument("gt_dir", type=Path, help="Ground-truth image directory.")
+    parser.add_argument(
+        "-o", "--output-dir", required=True, type=Path,
+        help="Directory in which colored SSIM maps are written.",
+    )
+    parser.add_argument(
+        "--window-size", default=11, type=int,
+        help="Positive odd SSIM window size (default: 11).",
+    )
+    parser.add_argument(
+        "--map-mode", choices=("dissimilarity", "ssim"), default="dissimilarity",
+        help="Visualize 1 - SSIM or SSIM itself (default: dissimilarity).",
+    )
+    parser.add_argument(
+        "--device", default="auto",
+        help="Torch device: auto, cpu, cuda, or cuda:<index> (default: auto).",
+    )
+    return parser.parse_args()
+
+
+def validate_args(args):
+    if args.window_size <= 0 or args.window_size % 2 == 0:
+        raise ValueError("--window-size must be a positive odd integer")
 
 
 def image_files(folder):
@@ -71,17 +93,15 @@ def visualization_values(channel_mean_ssim, mode):
     if mode == "dissimilarity":
         # Match the KNN visualization semantics: red means a larger error signal.
         return torch.clamp(1.0 - channel_mean_ssim, 0.0, 1.0)
-    raise ValueError("MAP_MODE must be 'ssim' or 'dissimilarity'")
+    raise ValueError("--map-mode must be 'ssim' or 'dissimilarity'")
 
 
 def main():
-    if WINDOW_SIZE <= 0 or WINDOW_SIZE % 2 == 0:
-        raise ValueError("WINDOW_SIZE must be a positive odd integer")
-    if MAP_MODE not in ("ssim", "dissimilarity"):
-        raise ValueError("MAP_MODE must be 'ssim' or 'dissimilarity'")
+    args = parse_args()
+    validate_args(args)
 
-    render_files = image_files(RENDER_DIR)
-    gt_files = image_files(GT_DIR)
+    render_files = image_files(args.render_dir)
+    gt_files = image_files(args.gt_dir)
     filenames = sorted(set(render_files) & set(gt_files))
     skipped_filenames = sorted((set(render_files) | set(gt_files)) - set(filenames))
     if not filenames:
@@ -89,8 +109,8 @@ def main():
     if skipped_filenames:
         print("Skipping {} unmatched files".format(len(skipped_filenames)))
 
-    device = resolve_device(DEVICE)
-    output_dir = OUTPUT_DIR.expanduser().resolve()
+    device = resolve_device(args.device)
+    output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     scores = {}
     with torch.no_grad():
@@ -103,10 +123,10 @@ def main():
                         filename, tuple(rendered.shape), tuple(gt.shape)
                     )
                 )
-            spatial_ssim = ssim_map(rendered, gt, window_size=WINDOW_SIZE)
+            spatial_ssim = ssim_map(rendered, gt, window_size=args.window_size)
             scores[filename] = float(spatial_ssim.mean().item())
             channel_mean_ssim = spatial_ssim.mean(dim=1).squeeze(0)
-            colored = heatmap(visualization_values(channel_mean_ssim, MAP_MODE))
+            colored = heatmap(visualization_values(channel_mean_ssim, args.map_mode))
             save_rgb_tensor(colored, output_dir / filename)
             print(
                 "SSIM maps: {}/{}".format(index, len(filenames)),
@@ -116,12 +136,12 @@ def main():
 
     mean_ssim = float(np.mean(list(scores.values())))
     metadata = {
-        "render_dir": str(RENDER_DIR.expanduser().resolve()),
-        "gt_dir": str(GT_DIR.expanduser().resolve()),
+        "render_dir": str(args.render_dir.expanduser().resolve()),
+        "gt_dir": str(args.gt_dir.expanduser().resolve()),
         "output_dir": str(output_dir),
-        "map_mode": MAP_MODE,
-        "visualized_value": "SSIM" if MAP_MODE == "ssim" else "1 - SSIM",
-        "window_size": WINDOW_SIZE,
+        "map_mode": args.map_mode,
+        "visualized_value": "SSIM" if args.map_mode == "ssim" else "1 - SSIM",
+        "window_size": args.window_size,
         "device": str(device),
         "colormap": "blue-cyan-yellow-red",
         "low_color": "blue",

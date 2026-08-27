@@ -117,6 +117,8 @@ def get_combined_args(parser : ArgumentParser):
 
     merged_dict = vars(args_cfgfile).copy()
     for k,v in vars(args_cmdline).items():
-        if v != None:
+        # A None CLI default must not overwrite a value loaded from cfg_args,
+        # but the attribute still has to exist when neither source defines it.
+        if v is not None or k not in merged_dict:
             merged_dict[k] = v
     return Namespace(**merged_dict)

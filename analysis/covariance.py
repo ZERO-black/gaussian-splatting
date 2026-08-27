@@ -8,30 +8,23 @@ Gaussian centers. The PLY vertex order is preserved.
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 
-try:
-    from analysis.knn import (
-        DEFAULT_PERCENTILES,
-        describe,
-        iter_knn_batches,
-        load_gaussian_geometry,
-        ply_property_name,
-        resolve_input,
-        write_annotated_ply,
-    )
-except ModuleNotFoundError:  # Direct invocation from outside the repository root.
-    from knn import (
-        DEFAULT_PERCENTILES,
-        describe,
-        iter_knn_batches,
-        load_gaussian_geometry,
-        ply_property_name,
-        resolve_input,
-        write_annotated_ply,
-    )
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from analysis.knn import (
+    DEFAULT_PERCENTILES,
+    describe,
+    iter_knn_batches,
+    load_gaussian_geometry,
+    ply_property_name,
+    resolve_input,
+    write_annotated_ply,
+)
 
 
 METRIC_LABELS = {
