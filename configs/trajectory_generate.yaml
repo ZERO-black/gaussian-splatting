@@ -1,0 +1,17 @@
+seed: 0
+num_waypoints: 21
+up: [0.0, -1.0, 0.0]
+
+sampling:
+  position_min: [-1.0, -1.0, -1.0]
+  position_max: [1.0, 1.0, 1.0]
+  minimum_endpoint_distance: 1.0
+  minimum_direction_dot: -0.95
+  max_attempts: 10000
+
+output:
+  path: ./cameras/random/trajectory.npz
+  position_key: cubic_trajectory
+  # With this default name, the trajectory loader discovers directions
+  # automatically even when trajectory.direction_key is null.
+  direction_key: cubic_trajectory_directions

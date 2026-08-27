@@ -22,18 +22,42 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(
-        self, args : ModelParams, gaussians : GaussianModel, load_iteration=None,
-        shuffle=True, resolution_scales=[1.0], load_ply_path=None,
-    ):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, uncertainty_iteration=None, shuffle=True, resolution_scales=[1.0], load_ply_path=None):
         """b
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.uncertainty_path = None
 
-        if load_iteration:
+        if uncertainty_iteration is not None:
+            point_cloud_root = os.path.join(self.model_path, "point_cloud")
+            if uncertainty_iteration == -1:
+                candidates = [
+                    int(name.removeprefix("error_"))
+                    for name in os.listdir(point_cloud_root)
+                    if name.startswith("error_")
+                    and name.removeprefix("error_").isdigit()
+                ]
+                if not candidates:
+                    raise FileNotFoundError(
+                        f"No error_* checkpoints found in {point_cloud_root}"
+                    )
+                uncertainty_iteration = max(candidates)
+
+            self.uncertainty_path = os.path.join(
+                point_cloud_root,
+                f"error_{uncertainty_iteration}",
+                "point_cloud.ply",
+            )
+            if not os.path.isfile(self.uncertainty_path):
+                raise FileNotFoundError(
+                    f"Uncertainty checkpoint does not exist: {self.uncertainty_path}"
+                )
+            self.loaded_iter = uncertainty_iteration
+            print(f"Loading uncertainty checkpoint at iteration {self.loaded_iter}")
+        elif load_iteration:
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
             else:
@@ -83,6 +107,16 @@ class Scene:
                 "iteration_" + str(self.loaded_iter), "point_cloud.ply",
             )
             self.gaussians.load_ply(point_cloud_path, args.train_test_exp)
+            if self.uncertainty_path is not None:
+                self.gaussians.load_ply_uncertainty(
+                    self.uncertainty_path,
+                    args.train_test_exp,
+                )
+            else:
+                self.gaussians.load_ply(os.path.join(self.model_path,
+                                                               "point_cloud",
+                                                               "iteration_" + str(self.loaded_iter),
+                                                               "point_cloud.ply"), args.train_test_exp)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
