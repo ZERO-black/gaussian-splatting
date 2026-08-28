@@ -1,5 +1,4 @@
 seed: 0
-num_waypoints: 21
 up: [0.0, -1.0, 0.0]
 
 sampling:

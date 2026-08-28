@@ -200,3 +200,78 @@ def render_uncertainty(
         "uncertainty_viewspace_points": screenspace_points,
         "uncertainty_visibility_filter": radii > 0,
     }
+
+
+def render_knn(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    knn_values: torch.Tensor,
+    scaling_modifier=1.0,
+):
+    """Render a frozen scalar KNN cost while retaining camera-pose gradients."""
+    expected_count = pc.get_xyz.shape[0]
+    if (
+        knn_values.ndim != 2
+        or knn_values.shape[0] != expected_count
+        or knn_values.shape[1] not in (1, 3)
+    ):
+        raise ValueError(
+            "knn_values must have shape [num_gaussians, 1 or 3], got "
+            f"{tuple(knn_values.shape)}"
+        )
+    if not torch.isfinite(knn_values).all():
+        raise ValueError("knn_values contains non-finite values")
+
+    screenspace_points = torch.zeros_like(
+        pc.get_xyz,
+        dtype=pc.get_xyz.dtype,
+        device="cuda",
+    )
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=0,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        antialiasing=pipe.antialiasing,
+    )
+    rasterizer = CameraGaussianRasterizer(raster_settings=raster_settings)
+
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling
+        rotations = pc.get_rotation
+
+    knn_colors = (
+        knn_values.repeat(1, 3) if knn_values.shape[1] == 1 else knn_values
+    )
+    rendered_knn, radii, _ = rasterizer(
+        means3D=pc.get_xyz,
+        means2D=screenspace_points,
+        shs=None,
+        colors_precomp=knn_colors,
+        opacities=pc.get_opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp,
+    )
+    return {
+        "knn": rendered_knn[:1],
+        "knn_viewspace_points": screenspace_points,
+        "knn_visibility_filter": radii > 0,
+    }

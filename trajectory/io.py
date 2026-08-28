@@ -1,8 +1,171 @@
 import json
+import re
 from pathlib import Path
 from typing import Sequence, Union
 
 import numpy as np
+
+
+_SIBR_PARAMETER = re.compile(r"(?:^|\s)-D\s+([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
+
+
+def resolve_camera_trajectory_path(path: Union[str, Path]) -> Path:
+    """Resolve an NPZ trajectory or SIBR key-camera .lookat export."""
+    path = Path(path).expanduser()
+    if path.is_file():
+        return path
+    raise FileNotFoundError(f"Camera trajectory not found: {path}")
+
+
+def load_camera_trajectory(
+    path: Union[str, Path],
+    key: str,
+    up: Sequence[float],
+    direction_key: str = None,
+) -> np.ndarray:
+    """Load NPZ or SIBR .lookat cameras as canonical 3DGS C2W poses."""
+    resolved_path = resolve_camera_trajectory_path(path)
+    suffix = resolved_path.suffix.lower()
+    if suffix == ".lookat":
+        return load_sibr_lookat_trajectory(resolved_path)
+    if suffix == ".npz":
+        return load_kaolin_camera_trajectory(
+            resolved_path,
+            key,
+            up,
+            direction_key=direction_key,
+        )
+    raise ValueError(
+        f"Unsupported camera trajectory format {suffix!r}: {resolved_path}; "
+        "expected a SIBR key-camera .lookat file or a legacy .npz file"
+    )
+
+
+def load_sibr_lookat_trajectory(path: Union[str, Path]) -> np.ndarray:
+    """Load SIBR origin/target/up records as canonical 3DGS C2W poses.
+
+    SIBR cameras use OpenGL local axes (+X right, +Y up, -Z viewing
+    direction). Canonical 3DGS camera axes are +X right, +Y down, +Z forward.
+    """
+    path = Path(path)
+    poses = []
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parameters = dict(_SIBR_PARAMETER.findall(line))
+        missing = {"origin", "target", "up"} - parameters.keys()
+        if missing:
+            raise ValueError(
+                f"{path}:{line_number} is missing SIBR parameters: {sorted(missing)}"
+            )
+        origin = _parse_sibr_vector(parameters["origin"], path, line_number, "origin")
+        target = _parse_sibr_vector(parameters["target"], path, line_number, "target")
+        camera_up = _parse_sibr_vector(parameters["up"], path, line_number, "up")
+        poses.append(_sibr_lookat_c2w(origin, target, camera_up, path, line_number))
+
+    if len(poses) < 2:
+        raise ValueError(f"SIBR trajectory must contain at least two cameras: {path}")
+    poses = np.stack(poses).astype(np.float32, copy=False)
+    _validate_c2w(poses)
+    return poses
+
+
+def save_sibr_lookat_trajectory(
+    path: Union[str, Path],
+    poses_c2w: np.ndarray,
+    up,
+    fovy_degrees: float,
+    znear: float = 0.01,
+    zfar: float = 100.0,
+) -> None:
+    """Save canonical 3DGS C2W poses as a SIBR key-camera ``.lookat`` file."""
+    poses_c2w = np.asarray(poses_c2w, dtype=np.float32)
+    _validate_c2w(poses_c2w)
+    if up is None:
+        up_vectors = -poses_c2w[:, :3, 1]
+    else:
+        up_vectors = np.asarray(up, dtype=np.float32)
+        if up_vectors.shape == (3,):
+            up_vectors = np.broadcast_to(up_vectors, (len(poses_c2w), 3)).copy()
+        if up_vectors.shape != (len(poses_c2w), 3):
+            raise ValueError("up must have shape [3] or [N, 3]")
+    if not np.isfinite(up_vectors).all():
+        raise ValueError("up vectors must be finite")
+    up_norms = np.linalg.norm(up_vectors, axis=1, keepdims=True)
+    if np.any(up_norms < 1e-8):
+        raise ValueError("up vectors must be non-zero")
+    up_vectors = up_vectors / up_norms
+    if not np.isfinite(fovy_degrees) or fovy_degrees <= 0:
+        raise ValueError("fovy_degrees must be finite and positive")
+    if not np.isfinite([znear, zfar]).all() or znear <= 0 or zfar <= znear:
+        raise ValueError("clip planes must satisfy 0 < znear < zfar")
+
+    lines = []
+    for pose, camera_up in zip(poses_c2w, up_vectors):
+        origin = pose[:3, 3]
+        target = origin + pose[:3, 2]
+        lines.append(
+            " -D origin={} -D target={} -D up={} -D fovy={:.6f} "
+            "-D clip={:.6f},{:.6f}".format(
+                _format_sibr_vector(origin),
+                _format_sibr_vector(target),
+                _format_sibr_vector(camera_up),
+                fovy_degrees,
+                znear,
+                zfar,
+            )
+        )
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _format_sibr_vector(vector: np.ndarray) -> str:
+    return ",".join(f"{float(value):.9f}" for value in vector)
+
+
+def _parse_sibr_vector(value, path: Path, line_number: int, name: str) -> np.ndarray:
+    try:
+        vector = np.asarray([float(part) for part in value.split(",")], dtype=np.float32)
+    except ValueError as exc:
+        raise ValueError(
+            f"{path}:{line_number} has an invalid {name} vector: {value!r}"
+        ) from exc
+    if vector.shape != (3,) or not np.isfinite(vector).all():
+        raise ValueError(
+            f"{path}:{line_number} has an invalid {name} vector: {value!r}"
+        )
+    return vector
+
+
+def _sibr_lookat_c2w(origin, target, camera_up, path: Path, line_number: int):
+    forward = target - origin
+    forward_norm = np.linalg.norm(forward)
+    up_norm = np.linalg.norm(camera_up)
+    if forward_norm < 1e-8:
+        raise ValueError(f"{path}:{line_number} has coincident origin and target")
+    if up_norm < 1e-8:
+        raise ValueError(f"{path}:{line_number} has a zero up vector")
+    forward = forward / forward_norm
+    camera_up = camera_up / up_norm
+    right = np.cross(forward, camera_up)
+    right_norm = np.linalg.norm(right)
+    if right_norm < 1e-8:
+        raise ValueError(
+            f"{path}:{line_number} has parallel viewing and up directions"
+        )
+    right = right / right_norm
+    down = np.cross(forward, right)
+    down = down / np.linalg.norm(down)
+
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, 0] = right
+    pose[:3, 1] = down
+    pose[:3, 2] = forward
+    pose[:3, 3] = origin
+    return pose
 
 
 def load_kaolin_camera_trajectory(
@@ -86,10 +249,19 @@ def save_trajectory(
         cubic_trajectory=poses_c2w[:, :3, 3],
         poses_c2w=poses_c2w,
     )
+    try:
+        resolved_source = resolve_camera_trajectory_path(source_path)
+    except FileNotFoundError:
+        resolved_source = Path(source_path)
+    source_format = (
+        "sibr_lookat"
+        if resolved_source.suffix.lower() == ".lookat"
+        else "kaolin_camera_positions_npz"
+    )
     metadata = {
         "pose_convention": "3dgs_c2w",
-        "source_format": "kaolin_camera_positions_npz",
-        "source_path": str(source_path),
+        "source_format": source_format,
+        "source_path": str(resolved_source),
         "source_key": source_key,
         "keys": {
             "cubic_trajectory": list(poses_c2w[:, :3, 3].shape),

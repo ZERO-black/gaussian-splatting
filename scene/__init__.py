@@ -22,7 +22,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, uncertainty_iteration=None, shuffle=True, resolution_scales=[1.0], load_ply_path=None):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, uncertainty_iteration=None, shuffle=True, resolution_scales=[1.0], load_ply_path=None, load_camera_images=True):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -97,26 +97,24 @@ class Scene:
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False, load_images=load_camera_images)
             print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True, load_images=load_camera_images)
 
         if self.loaded_iter:
-            point_cloud_path = load_ply_path or os.path.join(
-                self.model_path, "point_cloud",
-                "iteration_" + str(self.loaded_iter), "point_cloud.ply",
-            )
-            self.gaussians.load_ply(point_cloud_path, args.train_test_exp)
             if self.uncertainty_path is not None:
                 self.gaussians.load_ply_uncertainty(
                     self.uncertainty_path,
                     args.train_test_exp,
                 )
             else:
-                self.gaussians.load_ply(os.path.join(self.model_path,
-                                                               "point_cloud",
-                                                               "iteration_" + str(self.loaded_iter),
-                                                               "point_cloud.ply"), args.train_test_exp)
+                point_cloud_path = load_ply_path or os.path.join(
+                    self.model_path,
+                    "point_cloud",
+                    "iteration_" + str(self.loaded_iter),
+                    "point_cloud.ply",
+                )
+                self.gaussians.load_ply(point_cloud_path, args.train_test_exp)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 

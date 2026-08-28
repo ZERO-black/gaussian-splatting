@@ -5,7 +5,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from .io import load_kaolin_camera_trajectory
+from .interpolation import interpolate_camera_pair_linear
+from .io import load_camera_trajectory, resolve_camera_trajectory_path
 
 
 def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
@@ -53,7 +54,7 @@ def _rotation_with_fixed_up(
     # Choose a deterministic direction in the plane as a rare-case fallback.
     parallel = torch.linalg.vector_norm(forward, dim=-1, keepdim=True) < 1e-6
     axes = torch.eye(3, dtype=rotation.dtype, device=rotation.device)
-    fallback_axis = axes[world_up.abs().argmin()].expand_as(forward)
+    fallback_axis = axes[world_up.abs().argmin(dim=-1)].expand_as(forward)
     fallback_forward = fallback_axis - (
         fallback_axis * up
     ).sum(dim=-1, keepdim=True) * up
@@ -79,26 +80,63 @@ class TrainableTrajectory(nn.Module):
         self._validate(initial_c2w)
 
         if world_up is None:
-            world_up = -initial_c2w[0, :3, 1]
+            world_up = -initial_c2w[:, :3, 1]
         world_up = torch.as_tensor(
             world_up,
             dtype=initial_c2w.dtype,
             device=initial_c2w.device,
         )
-        if world_up.shape != (3,) or not torch.isfinite(world_up).all():
-            raise ValueError("world_up must be a finite 3D vector")
-        if torch.linalg.vector_norm(world_up) < 1e-8:
-            raise ValueError("world_up must be non-zero")
+        if world_up.shape == (3,):
+            world_up = world_up.expand(initial_c2w.shape[0], 3).clone()
+        if world_up.shape != (initial_c2w.shape[0], 3) or not torch.isfinite(world_up).all():
+            raise ValueError("world_up must be finite with shape [3] or [N, 3]")
+        world_up_norm = torch.linalg.vector_norm(world_up, dim=-1, keepdim=True)
+        if (world_up_norm < 1e-8).any():
+            raise ValueError("world_up vectors must be non-zero")
 
         self.register_buffer("initial_c2w", initial_c2w.clone())
         self.register_buffer(
             "world_up",
-            world_up / torch.linalg.vector_norm(world_up),
+            world_up / world_up_norm,
             persistent=False,
         )
         num_interior = initial_c2w.shape[0] - 2
         self.translation_delta = nn.Parameter(initial_c2w.new_zeros(num_interior, 3))
         self.rotation_delta = nn.Parameter(initial_c2w.new_zeros(num_interior, 3))
+
+    @classmethod
+    def from_file(
+        cls,
+        path: Union[str, Path],
+        key: str,
+        up,
+        device: Optional[Union[str, torch.device]] = None,
+        direction_key: Optional[str] = None,
+        intermediate_waypoints: int = 0,
+    ) -> "TrainableTrajectory":
+        resolved_path = resolve_camera_trajectory_path(path)
+        initial_c2w = load_camera_trajectory(
+            resolved_path,
+            key,
+            up,
+            direction_key=direction_key,
+        )
+        if intermediate_waypoints < 0:
+            raise ValueError("intermediate_waypoints must be non-negative")
+        if initial_c2w.shape[0] == 2 and intermediate_waypoints > 0:
+            initial_c2w = interpolate_camera_pair_linear(
+                initial_c2w[0],
+                initial_c2w[1],
+                intermediate_waypoints,
+                up=None if resolved_path.suffix.lower() == ".lookat" else up,
+            )
+        trajectory = cls(
+            initial_c2w,
+            # SIBR records a camera-specific up vector. Preserve it exactly;
+            # position-only NPZ inputs continue to use the configured world up.
+            world_up=None if resolved_path.suffix.lower() == ".lookat" else up,
+        )
+        return trajectory.to(device) if device is not None else trajectory
 
     @classmethod
     def from_npz(
@@ -108,17 +146,17 @@ class TrainableTrajectory(nn.Module):
         up,
         device: Optional[Union[str, torch.device]] = None,
         direction_key: Optional[str] = None,
+        intermediate_waypoints: int = 0,
     ) -> "TrainableTrajectory":
-        trajectory = cls(
-            load_kaolin_camera_trajectory(
-                path,
-                key,
-                up,
-                direction_key=direction_key,
-            ),
-            world_up=up,
+        """Backward-compatible alias for NPZ and SIBR trajectory inputs."""
+        return cls.from_file(
+            path,
+            key,
+            up,
+            device,
+            direction_key,
+            intermediate_waypoints,
         )
-        return trajectory.to(device) if device is not None else trajectory
 
     @staticmethod
     def _validate(initial_c2w: torch.Tensor) -> None:
@@ -141,7 +179,7 @@ class TrainableTrajectory(nn.Module):
         )
         corrected_rotation = _rotation_with_fixed_up(
             proposed_rotation,
-            self.world_up,
+            self.world_up[1:-1],
         )
         corrected_center = initial_interior[:, :3, 3] + self.translation_delta
 
@@ -180,7 +218,7 @@ class TrainableTrajectory(nn.Module):
         )
         corrected_rotation = _rotation_with_fixed_up(
             proposed_rotation,
-            self.world_up,
+            self.world_up[index],
         )
         corrected_center = (
             initial_pose[:3, 3] + self.translation_delta[delta_index]

@@ -1,6 +1,6 @@
 model:
   source_path: ./data/mipnerf360/bicycle
-  model_path: output/bec60fe6-4
+  model_path: ./models/bicycle
   iteration: -1
   sh_degree: 3
   images: images
@@ -17,13 +17,25 @@ pipeline:
   debug: false
   antialiasing: false
 
-uncertainty:
-  enabled: true
-  iteration: -1
-  background: [1.0, 1.0, 1.0]
+knn:
+  # Defaults to <model_path>/knn_analysis/iteration_<n>/point_cloud_knn.ply.
+  # Run analysis/knn.py before optimize_trajectory.py.
+  ply_path: models/bicycle/knn_analysis/iteration_30000/point_cloud_knn.ply
+  metric: mean
+  k: 10
+  # null reads the preprocessing tail threshold from the adjacent summary.json.
+  tail_threshold: null
+  # Empty pixels retain maximum cost so looking away from the scene is penalized.
+  background: 1.0
 
 trajectory:
-  path: ./cameras/random/trajectory.npz
+  # Use the .lookat file produced by SIBR's "Save key cameras..." action.
+  # Legacy NPZ trajectories remain supported.
+  path: ./cameras/bicycle/path.lookat
+  # When the input contains only start/end cameras, create this many trainable
+  # waypoints between them before optimization.
+  intermediate_waypoints: 20
+  # key, direction_key, and up are NPZ-only; SIBR uses its saved target/up values.
   key: cubic_trajectory
   direction_key: null
   up: [0, -1, 0]
@@ -31,26 +43,25 @@ trajectory:
   reference_camera_index: 0
 
 optimization:
-  iterations: 100
+  iterations: 1000
   translation_lr: 0.005
   rotation_lr: 0.005
 
 loss:
-  uncertainty_weight: 1e5
+  knn_weight: 100.0
   photometric_weight: 0.0
   translation_offset_weight: 1.0
   rotation_offset_weight: 1.0
-  acceleration_weight: 1e3
+  acceleration_weight: 1000.0
 
 checkpoint:
-  interval: 25
+  interval: 50
   resume: null
-  intermediate_frames: 10
+  intermediate_frames: 20
   fps: 30
   codec: mp4v
 
 logging:
-  preview_interval: 100
   wandb:
     enabled: true
     project: 3dgs-camera-gradient

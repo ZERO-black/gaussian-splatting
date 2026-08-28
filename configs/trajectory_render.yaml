@@ -23,7 +23,10 @@ uncertainty:
   background: [0.0, 0.0, 0.0]
 
 trajectory:
+  # Use the .lookat file produced by SIBR's "Save key cameras..." action.
+  # Legacy NPZ trajectories remain supported.
   path: "./cameras/bicycle/test.npz"
+  # key, direction_key, and up are NPZ-only; SIBR uses its saved target/up values.
   key: cubic_trajectory
   direction_key: null
   # up: [0.0944, -0.9776, -0.1880]  # Kaolin Camera.from_args(..., up=...); not stored in the NPZ

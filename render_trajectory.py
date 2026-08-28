@@ -7,7 +7,11 @@ from omegaconf import OmegaConf
 from gaussian_renderer import GaussianModel
 from scene import Scene
 from trajectory.interpolation import interpolate_trajectory
-from trajectory.io import load_kaolin_camera_trajectory, save_trajectory
+from trajectory.io import (
+    load_camera_trajectory,
+    resolve_camera_trajectory_path,
+    save_trajectory,
+)
 from trajectory.renderer import TrajectoryRenderer
 from utils.general_utils import safe_state
 
@@ -33,6 +37,7 @@ def render_trajectory(config) -> None:
             else None
         ),
         shuffle=False,
+        load_camera_images=False,
     )
 
     if config.trajectory.camera_split == "train":
@@ -42,8 +47,9 @@ def render_trajectory(config) -> None:
     else:
         raise ValueError("trajectory.camera_split must be 'train' or 'test'")
 
-    poses_c2w = load_kaolin_camera_trajectory(
-        config.trajectory.path,
+    trajectory_path = resolve_camera_trajectory_path(config.trajectory.path)
+    poses_c2w = load_camera_trajectory(
+        trajectory_path,
         config.trajectory.key,
         config.trajectory.up,
         direction_key=config.trajectory.direction_key,
@@ -53,7 +59,11 @@ def render_trajectory(config) -> None:
     interpolated_c2w = interpolate_trajectory(
         poses_c2w,
         config.trajectory.intermediate_frames,
-        up=config.trajectory.up,
+        up=(
+            None
+            if trajectory_path.suffix.lower() == ".lookat"
+            else config.trajectory.up
+        ),
     )
     output_dir = Path(config.output.directory)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,13 +71,13 @@ def render_trajectory(config) -> None:
     save_trajectory(
         output_dir / "keyframes.npz",
         poses_c2w,
-        config.trajectory.path,
+        trajectory_path,
         config.trajectory.key,
     )
     save_trajectory(
         output_dir / "interpolated.npz",
         interpolated_c2w,
-        config.trajectory.path,
+        trajectory_path,
         config.trajectory.key,
     )
 

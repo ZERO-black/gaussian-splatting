@@ -1,3 +1,5 @@
+import json
+import math
 import time
 from pathlib import Path
 
@@ -6,14 +8,16 @@ import torchvision
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from analysis.knn import STATIC_METRICS, ply_property_name
 from gaussian_renderer import GaussianModel
 from scene import Scene
 from trajectory.interpolation import interpolate_trajectory
-from trajectory.io import save_trajectory
-from trajectory.losses import uncertainty_loss
+from trajectory.io import resolve_camera_trajectory_path, save_trajectory
+from trajectory.losses import knn_loss
 from trajectory.model import TrainableTrajectory
 from trajectory.renderer import TrajectoryRenderer
 from utils.general_utils import safe_state
+from utils.system_utils import searchForMaxIteration
 
 try:
     import wandb
@@ -57,15 +61,24 @@ class TrajectoryTrainer:
             raise ValueError("checkpoint.fps must be positive")
         if len(self.config.checkpoint.codec) != 4:
             raise ValueError("checkpoint.codec must contain exactly four characters")
-        if self.config.logging.preview_interval < 1:
-            raise ValueError("logging.preview_interval must be positive")
-        if self.config.uncertainty.enabled:
-            if self.config.uncertainty.iteration == 0 or self.config.uncertainty.iteration < -1:
-                raise ValueError(
-                    "uncertainty.iteration must be positive or -1 for the latest checkpoint"
-                )
-            if len(self.config.uncertainty.background) != 3:
-                raise ValueError("uncertainty.background must contain three values")
+        if self.config.model.iteration == 0 or self.config.model.iteration < -1:
+            raise ValueError("model.iteration must be positive or -1 for the latest")
+        if self.config.knn.metric not in STATIC_METRICS:
+            raise ValueError(
+                f"knn.metric must be one of {STATIC_METRICS}, got "
+                f"{self.config.knn.metric!r}"
+            )
+        if self.config.knn.k <= 0:
+            raise ValueError("knn.k must be positive")
+        if self.config.trajectory.intermediate_waypoints < 0:
+            raise ValueError("trajectory.intermediate_waypoints must be non-negative")
+        if not 0.0 <= self.config.knn.background <= 1.0:
+            raise ValueError("knn.background must be in [0, 1]")
+        if (
+            self.config.knn.tail_threshold is not None
+            and self.config.knn.tail_threshold <= 0
+        ):
+            raise ValueError("knn.tail_threshold must be positive when provided")
 
     def _prepare_output(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -76,19 +89,41 @@ class TrajectoryTrainer:
 
     def _setup_scene(self) -> None:
         safe_state(self.config.runtime.quiet)
+        model_iteration = self.config.model.iteration
+        if model_iteration == -1:
+            model_iteration = searchForMaxIteration(
+                str(Path(self.config.model.model_path) / "point_cloud")
+            )
+        self.knn_ply_path = self._resolve_knn_ply(model_iteration)
+
         self.gaussians = GaussianModel(self.config.model.sh_degree)
         self.scene = Scene(
             self.config.model,
             self.gaussians,
-            load_iteration=self.config.model.iteration,
-            uncertainty_iteration=(
-                self.config.uncertainty.iteration
-                if self.config.uncertainty.enabled
-                else None
-            ),
+            load_iteration=model_iteration,
             shuffle=False,
+            load_ply_path=str(self.knn_ply_path),
+            load_camera_images=False,
         )
         self._freeze_gaussians()
+
+        property_name = ply_property_name(self.config.knn.metric, self.config.knn.k)
+        try:
+            raw_knn_values = self.gaussians.get_knn_metric(property_name)
+        except KeyError as exc:
+            raise ValueError(
+                f"KNN metric {property_name!r} is missing from {self.knn_ply_path}"
+            ) from exc
+        tail_threshold = self._resolve_tail_threshold(property_name)
+        self.knn_values = torch.clamp(raw_knn_values / tail_threshold, 0.0, 1.0)
+        self.knn_values.requires_grad_(False)
+        self.config.knn.ply_path = str(self.knn_ply_path)
+        self.config.knn.tail_threshold = tail_threshold
+        OmegaConf.save(self.config, self.output_dir / "config.yaml")
+        print(
+            f"KNN objective: {property_name} from {self.knn_ply_path} "
+            f"(tail threshold={tail_threshold:g})"
+        )
 
         if self.config.trajectory.camera_split == "train":
             cameras = self.scene.getTrainCameras()
@@ -115,16 +150,62 @@ class TrajectoryTrainer:
             self.gaussians,
             self.config.pipeline,
             self.background,
-            uncertainty_background=(
-                torch.tensor(
-                    self.config.uncertainty.background,
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                if self.config.uncertainty.enabled
-                else None
+            knn_background=torch.full(
+                (3,),
+                self.config.knn.background,
+                dtype=torch.float32,
+                device=self.device,
             ),
+            knn_values=self.knn_values,
         )
+
+    def _resolve_knn_ply(self, model_iteration: int) -> Path:
+        configured_path = self.config.knn.ply_path
+        if configured_path is None:
+            path = (
+                Path(self.config.model.model_path)
+                / "knn_analysis"
+                / f"iteration_{model_iteration}"
+                / "point_cloud_knn.ply"
+            )
+        else:
+            path = Path(configured_path).expanduser()
+        path = path.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"KNN-annotated PLY not found: {path}. Run analysis/knn.py "
+                "for this model and iteration before optimizing the trajectory."
+            )
+        return path
+
+    def _resolve_tail_threshold(self, property_name: str) -> float:
+        configured_threshold = self.config.knn.tail_threshold
+        if configured_threshold is not None:
+            threshold = float(configured_threshold)
+        else:
+            summary_path = self.knn_ply_path.parent / "summary.json"
+            if not summary_path.is_file():
+                raise FileNotFoundError(
+                    f"KNN summary not found: {summary_path}. Set knn.tail_threshold "
+                    "explicitly or keep summary.json beside point_cloud_knn.ply."
+                )
+            with summary_path.open() as stream:
+                summary = json.load(stream)
+            try:
+                threshold = float(
+                    summary["metrics"][str(self.config.knn.k)]
+                    [self.config.knn.metric]["tail_threshold"]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"No tail threshold for {property_name!r} in {summary_path}"
+                ) from exc
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError(
+                f"Tail threshold for {property_name!r} must be finite and positive, "
+                f"got {threshold}"
+            )
+        return threshold
 
     def _freeze_gaussians(self) -> None:
         parameter_names = (
@@ -143,12 +224,15 @@ class TrajectoryTrainer:
                 value.requires_grad_(False)
 
     def _setup_trajectory(self) -> None:
-        self.trajectory_model = TrainableTrajectory.from_npz(
-            self.config.trajectory.path,
+        resolved_path = resolve_camera_trajectory_path(self.config.trajectory.path)
+        self.trajectory_uses_saved_up = resolved_path.suffix.lower() == ".lookat"
+        self.trajectory_model = TrainableTrajectory.from_file(
+            resolved_path,
             self.config.trajectory.key,
             self.config.trajectory.up,
             device=self.device,
             direction_key=self.config.trajectory.direction_key,
+            intermediate_waypoints=self.config.trajectory.intermediate_waypoints,
         )
 
     def _setup_optimizer(self) -> None:
@@ -214,11 +298,9 @@ class TrajectoryTrainer:
             "acceleration": acceleration_loss,
         }
 
-    def _backward_uncertainty_one_camera_at_a_time(self) -> torch.Tensor:
+    def _backward_knn_one_camera_at_a_time(self) -> torch.Tensor:
         """Accumulate pose gradients without retaining another camera's graph."""
         zero = self.trajectory_model.initial_c2w.new_zeros(())
-        if not self.config.uncertainty.enabled:
-            return zero
 
         # Endpoints are fixed, so rendering them cannot contribute a parameter
         # gradient. Each interior pose is rebuilt to give this camera its own graph.
@@ -227,25 +309,25 @@ class TrajectoryTrainer:
         if num_cameras == 0:
             return zero
 
-        uncertainty_sum = zero
-        loss_scale = self.config.loss.uncertainty_weight / num_cameras
+        knn_sum = zero
+        loss_scale = self.config.loss.knn_weight / num_cameras
         for camera_index in camera_indices:
             pose_c2w = self.trajectory_model(camera_index)
-            render_output = self.renderer.render_uncertainty_pose(
+            render_output = self.renderer.render_knn_pose(
                 pose_c2w,
                 self.reference_camera,
             )
-            camera_loss = uncertainty_loss(render_output["uncertainty"])
+            camera_loss = knn_loss(render_output["knn"])
             if loss_scale != 0:
                 (loss_scale * camera_loss).backward()
-            uncertainty_sum = uncertainty_sum + camera_loss.detach()
+            knn_sum = knn_sum + camera_loss.detach()
 
             # These references own this camera's autograd and CUDA rasterization
             # buffers. Dropping them here keeps peak memory independent of the
             # number of cameras.
             del camera_loss, render_output, pose_c2w
 
-        return uncertainty_sum / num_cameras
+        return knn_sum / num_cameras
 
     @torch.no_grad()
     def _render_previews(self):
@@ -260,22 +342,22 @@ class TrajectoryTrainer:
         start_time = time.perf_counter()
 
         self.optimizer.zero_grad(set_to_none=True)
-        uncertainty_loss = self._backward_uncertainty_one_camera_at_a_time()
+        rendered_knn_loss = self._backward_knn_one_camera_at_a_time()
 
         path_losses = self._get_path_losses()
         if path_losses["total"].requires_grad:
             path_losses["total"].backward()
         self.optimizer.step()
 
-        photometric_loss = uncertainty_loss.new_zeros(())
+        photometric_loss = rendered_knn_loss.new_zeros(())
         total_loss = (
-            self.config.loss.uncertainty_weight * uncertainty_loss
+            self.config.loss.knn_weight * rendered_knn_loss
             + path_losses["total"].detach()
             + self.config.loss.photometric_weight * photometric_loss
         )
         losses = {
             "total": total_loss,
-            "uncertainty": uncertainty_loss,
+            "knn": rendered_knn_loss,
             "photometric": photometric_loss,
             "translation_offset": path_losses["translation_offset"].detach(),
             "rotation_offset": path_losses["rotation_offset"].detach(),
@@ -284,7 +366,7 @@ class TrajectoryTrainer:
 
         renders = (
             self._render_previews()
-            if iteration % self.config.logging.preview_interval == 0
+            if iteration % self.config.checkpoint.interval == 0
             else None
         )
 
@@ -352,24 +434,19 @@ class TrajectoryTrainer:
     @torch.no_grad()
     def save_iteration_previews(self, iteration: int) -> None:
         """Save comparable visual artifacts for an optimization iteration."""
-        if not self.config.uncertainty.enabled:
-            raise RuntimeError(
-                "Checkpoint uncertainty renders require uncertainty.enabled=true"
-            )
-
         artifact_dir = self.preview_dir / f"iteration_{iteration:06d}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         poses_c2w = self.trajectory_model().detach().cpu().numpy()
         interpolated_c2w = interpolate_trajectory(
             poses_c2w,
             self.config.checkpoint.intermediate_frames,
-            up=self.config.trajectory.up,
+            up=None if self.trajectory_uses_saved_up else self.config.trajectory.up,
         )
 
-        self.renderer.render_uncertainty_keyframes(
+        self.renderer.render_knn_keyframes(
             poses_c2w,
             self.reference_camera,
-            artifact_dir / "waypoint_uncertainty",
+            artifact_dir / "waypoint_knn",
         )
         self.renderer.render_video(
             interpolated_c2w,
@@ -382,10 +459,10 @@ class TrajectoryTrainer:
         self.renderer.render_video(
             interpolated_c2w,
             self.reference_camera,
-            artifact_dir / "trajectory_uncertainty.mp4",
+            artifact_dir / "trajectory_knn.mp4",
             self.config.checkpoint.fps,
             self.config.checkpoint.codec,
-            output_type="uncertainty",
+            output_type="knn",
         )
         print(f"Saved iteration previews: {artifact_dir}")
 
@@ -418,7 +495,7 @@ class TrajectoryTrainer:
                 forward_output, _ = self.run_train_iter(iteration)
                 progress.set_postfix(loss=f"{self.ema_loss:.6f}")
 
-                if iteration % self.config.logging.preview_interval == 0:
+                if iteration % self.config.checkpoint.interval == 0:
                     self.save_previews(forward_output["renders"], iteration)
                 del forward_output
                 if (
