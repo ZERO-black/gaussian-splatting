@@ -36,70 +36,16 @@ def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _rotation_with_fixed_up(
-    rotation: torch.Tensor,
-    world_up: torch.Tensor,
-) -> torch.Tensor:
-    """Construct a rotation whose camera-up is exactly ``world_up``."""
-    proposed_forward = torch.nn.functional.normalize(
-        rotation[..., :, 2],
-        dim=-1,
-    )
-    up = world_up.expand_as(proposed_forward)
-    forward = proposed_forward - (
-        proposed_forward * up
-    ).sum(dim=-1, keepdim=True) * up
-
-    # A proposed direction parallel to up has no valid fixed-up camera pose.
-    # Choose a deterministic direction in the plane as a rare-case fallback.
-    parallel = torch.linalg.vector_norm(forward, dim=-1, keepdim=True) < 1e-6
-    axes = torch.eye(3, dtype=rotation.dtype, device=rotation.device)
-    fallback_axis = axes[world_up.abs().argmin(dim=-1)].expand_as(forward)
-    fallback_forward = fallback_axis - (
-        fallback_axis * up
-    ).sum(dim=-1, keepdim=True) * up
-    forward = torch.where(parallel, fallback_forward, forward)
-    forward = torch.nn.functional.normalize(forward, dim=-1)
-
-    right = torch.linalg.cross(forward, up, dim=-1)
-    right = torch.nn.functional.normalize(right, dim=-1)
-
-    # 3DGS camera coordinates use +Y down and +Z forward.
-    down = torch.linalg.cross(forward, right, dim=-1)
-    return torch.stack((right, down, forward), dim=-1)
-
-
 class TrainableTrajectory(nn.Module):
     def __init__(
         self,
         initial_c2w: Union[np.ndarray, torch.Tensor],
-        world_up: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ):
         super().__init__()
         initial_c2w = torch.as_tensor(initial_c2w, dtype=torch.float32)
         self._validate(initial_c2w)
 
-        if world_up is None:
-            world_up = -initial_c2w[:, :3, 1]
-        world_up = torch.as_tensor(
-            world_up,
-            dtype=initial_c2w.dtype,
-            device=initial_c2w.device,
-        )
-        if world_up.shape == (3,):
-            world_up = world_up.expand(initial_c2w.shape[0], 3).clone()
-        if world_up.shape != (initial_c2w.shape[0], 3) or not torch.isfinite(world_up).all():
-            raise ValueError("world_up must be finite with shape [3] or [N, 3]")
-        world_up_norm = torch.linalg.vector_norm(world_up, dim=-1, keepdim=True)
-        if (world_up_norm < 1e-8).any():
-            raise ValueError("world_up vectors must be non-zero")
-
         self.register_buffer("initial_c2w", initial_c2w.clone())
-        self.register_buffer(
-            "world_up",
-            world_up / world_up_norm,
-            persistent=False,
-        )
         num_interior = initial_c2w.shape[0] - 2
         self.translation_delta = nn.Parameter(initial_c2w.new_zeros(num_interior, 3))
         self.rotation_delta = nn.Parameter(initial_c2w.new_zeros(num_interior, 3))
@@ -128,14 +74,9 @@ class TrainableTrajectory(nn.Module):
                 initial_c2w[0],
                 initial_c2w[1],
                 intermediate_waypoints,
-                up=None if resolved_path.suffix.lower() == ".lookat" else up,
+                up=None,
             )
-        trajectory = cls(
-            initial_c2w,
-            # SIBR records a camera-specific up vector. Preserve it exactly;
-            # position-only NPZ inputs continue to use the configured world up.
-            world_up=None if resolved_path.suffix.lower() == ".lookat" else up,
-        )
+        trajectory = cls(initial_c2w)
         return trajectory.to(device) if device is not None else trajectory
 
     @classmethod
@@ -177,16 +118,12 @@ class TrainableTrajectory(nn.Module):
             initial_interior[:, :3, :3]
             @ _axis_angle_to_matrix(self.rotation_delta)
         )
-        corrected_rotation = _rotation_with_fixed_up(
-            proposed_rotation,
-            self.world_up[1:-1],
-        )
         corrected_center = initial_interior[:, :3, 3] + self.translation_delta
 
         bottom_row = initial_interior[:, 3:4, :]
         interior_c2w = torch.cat(
             (
-                torch.cat((corrected_rotation, corrected_center[..., None]), dim=-1),
+                torch.cat((proposed_rotation, corrected_center[..., None]), dim=-1),
                 bottom_row,
             ),
             dim=-2,
@@ -216,17 +153,13 @@ class TrainableTrajectory(nn.Module):
             initial_pose[:3, :3]
             @ _axis_angle_to_matrix(self.rotation_delta[delta_index])
         )
-        corrected_rotation = _rotation_with_fixed_up(
-            proposed_rotation,
-            self.world_up[index],
-        )
         corrected_center = (
             initial_pose[:3, 3] + self.translation_delta[delta_index]
         )
         return torch.cat(
             (
                 torch.cat(
-                    (corrected_rotation, corrected_center[:, None]), dim=-1
+                    (proposed_rotation, corrected_center[:, None]), dim=-1
                 ),
                 initial_pose[3:4],
             ),

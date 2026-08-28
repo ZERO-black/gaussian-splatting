@@ -27,11 +27,17 @@ knn:
   tail_threshold: null
   # Empty pixels retain maximum cost so looking away from the scene is penalized.
   background: 1.0
+  # Divide each Gaussian's normalized KNN value by its Euclidean distance from
+  # the current camera center. Disable to use the original view-independent cost.
+  normalize_by_camera_distance: true
+  # Absolute lower plateau applied after camera-distance normalization and
+  # rasterization. This initial value is q0.5 from rendered distribution analysis.
+  threshold: 0.07185056805610657
 
 trajectory:
   # Use the .lookat file produced by SIBR's "Save key cameras..." action.
   # Legacy NPZ trajectories remain supported.
-  path: ./cameras/bicycle/path.lookat
+  path: ./cameras/bicycle/0197.lookat
   # When the input contains only start/end cameras, create this many trainable
   # waypoints between them before optimization.
   intermediate_waypoints: 20
@@ -43,7 +49,7 @@ trajectory:
   reference_camera_index: 0
 
 optimization:
-  iterations: 1000
+  iterations: 500
   translation_lr: 0.005
   rotation_lr: 0.005
 
@@ -52,12 +58,18 @@ loss:
   photometric_weight: 0.0
   translation_offset_weight: 1.0
   rotation_offset_weight: 1.0
-  acceleration_weight: 1000.0
+  # Softly preserve each waypoint's SLERP-interpolated horizon while allowing
+  # the view direction to optimize freely in yaw and pitch.
+  roll_weight: 10.0
+  acceleration_weight: 3000.0
+  # Directly penalize turns between normalized adjacent translation segments.
+  tangent_weight: 1000.0
+  rotation_acceleration_weight: 1000.0
 
 checkpoint:
   interval: 50
   resume: null
-  intermediate_frames: 20
+  intermediate_frames: 15
   fps: 30
   codec: mp4v
 

@@ -14,7 +14,11 @@ import torch
 import torchvision
 from tqdm import tqdm
 
-from analysis.knn import STATIC_METRICS
+from analysis.knn import (
+    STATIC_METRICS,
+    distribution_quantile_label,
+    validate_distribution_quantiles,
+)
 from analysis.metric_histogram import (
     build_histogram_spec,
     sample_values,
@@ -31,9 +35,11 @@ from analysis.metric_core import (
     colorize,
     compute_metric_values,
     metric_is_available,
+    metric_quantiles,
     normalization_bounds,
     prepare_metric_context,
     valid_metric_mask,
+    valid_metric_samples,
 )
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, render
@@ -146,6 +152,7 @@ def render_metric_split(
     }
 
     static_values = static_valid = static_lower = static_upper = None
+    threshold_variants = []
     histogram_chunks = []
     if not is_view_dependent:
         static_values, static_valid = compute_metric_values(
@@ -165,6 +172,50 @@ def render_metric_split(
                 seed=args.histogram_seed,
             )
         )
+
+        if args.threshold_quantiles:
+            samples = valid_metric_samples(static_values, static_valid)
+            threshold_values = metric_quantiles(samples, args.threshold_quantiles)
+            for quantile, threshold in zip(
+                args.threshold_quantiles, threshold_values
+            ):
+                label = distribution_quantile_label(quantile)
+                variant_dir = os.path.join(output_dir, f"threshold_{label}")
+                variant_render_dir = os.path.join(variant_dir, "renders")
+                makedirs(variant_render_dir, exist_ok=True)
+                save_colormap(variant_dir, background.dtype, background.device)
+                threshold_variants.append({
+                    "quantile": quantile,
+                    "label": label,
+                    "threshold": float(threshold),
+                    "output_dir": variant_dir,
+                    "render_dir": variant_render_dir,
+                })
+                plateau_count = int(
+                    (samples <= float(threshold)).sum().item()
+                )
+                threshold_variants[-1]["plateau_count"] = plateau_count
+                threshold_variants[-1]["plateau_fraction"] = (
+                    plateau_count / samples.numel()
+                )
+                print(
+                    f"  {label}: threshold={float(threshold):.9g}, "
+                    f"plateau={plateau_count:,}/{samples.numel():,} "
+                    f"({plateau_count / samples.numel():.2%})"
+                )
+            del samples
+
+            metadata["lower_threshold_plateaus"] = {
+                variant["label"]: {
+                    "quantile": variant["quantile"],
+                    "threshold": variant["threshold"],
+                    "plateau_count": variant["plateau_count"],
+                    "plateau_fraction": variant["plateau_fraction"],
+                    "directory": os.path.relpath(variant["output_dir"], output_dir),
+                }
+                for variant in threshold_variants
+            }
+            metadata["threshold_rule"] = "max(metric_value, quantile_value)"
 
     for index, view in enumerate(tqdm(views, desc=f"Rendering {metric} ({split_name})")):
         if is_view_dependent:
@@ -207,9 +258,53 @@ def render_metric_split(
         torchvision.utils.save_image(
             image, os.path.join(render_dir, f"{index:05d}.png")
         )
+        del colors, image
+
+        for variant in threshold_variants:
+            thresholded_values = torch.clamp_min(values, variant["threshold"])
+            thresholded_colors = colorize(thresholded_values, lower, upper)
+            thresholded_image = render(
+                view,
+                gaussians,
+                pipeline,
+                background,
+                use_trained_exp=False,
+                separate_sh=SEPARATE_SH,
+                override_color=thresholded_colors,
+            )["render"]
+            if train_test_exp:
+                thresholded_image = thresholded_image[
+                    ..., thresholded_image.shape[-1] // 2 :
+                ]
+            torchvision.utils.save_image(
+                thresholded_image,
+                os.path.join(variant["render_dir"], f"{index:05d}.png"),
+            )
+            del thresholded_values, thresholded_colors, thresholded_image
 
     with open(os.path.join(output_dir, "normalization.json"), "w") as stream:
         json.dump(metadata, stream, indent=2)
+
+    for variant in threshold_variants:
+        variant_metadata = {
+            "metric": metric,
+            "description": METRIC_DESCRIPTIONS[metric],
+            "k": k,
+            "input_ply": args.analysis_ply,
+            "threshold_quantile": variant["quantile"],
+            "threshold_value": variant["threshold"],
+            "threshold_rule": "max(metric_value, threshold_value)",
+            "plateau_count": variant["plateau_count"],
+            "plateau_fraction": variant["plateau_fraction"],
+            "normalization_min": static_lower,
+            "normalization_max": static_upper,
+            "normalization_source": "original unthresholded scene distribution",
+            "colormap": "blue-cyan-yellow-red",
+        }
+        with open(
+            os.path.join(variant["output_dir"], "normalization.json"), "w"
+        ) as stream:
+            json.dump(variant_metadata, stream, indent=2)
 
     histogram_chunks = [chunk for chunk in histogram_chunks if chunk.numel()]
     if histogram_chunks:
@@ -278,10 +373,9 @@ def render_sets(dataset, iteration, pipeline, args):
             )
 
         context = prepare_metric_context(gaussians, metrics, args.knn_k)
+        # Undefined metric pixels must be visually unmistakable high risk.
         background = torch.tensor(
-            [1, 1, 1] if dataset.white_background else [0, 0, 0],
-            dtype=torch.float32,
-            device="cuda",
+            [1.0, 0.0, 0.0], dtype=torch.float32, device="cuda"
         )
 
         for metric in metrics:
@@ -337,6 +431,17 @@ if __name__ == "__main__":
     parser.add_argument("--knn_k", type=int, default=10)
     parser.add_argument("--metrics", nargs="+", choices=ALL_METRICS, default=None)
     parser.add_argument(
+        "--threshold_quantiles",
+        "--threshold-quantiles",
+        nargs="+",
+        type=float,
+        default=None,
+        help=(
+            "Render extra lower-plateau variants. Values are distribution "
+            "probabilities in [0, 1]; for example 0.9 uses the 90%% quantile."
+        ),
+    )
+    parser.add_argument(
         "--percentile_min",
         type=float,
         default=1.0,
@@ -371,8 +476,21 @@ if __name__ == "__main__":
     )
 
     args = get_combined_args(parser)
+    args.threshold_quantiles = validate_distribution_quantiles(
+        args.threshold_quantiles
+    )
     if args.knn_k <= 0:
         raise ValueError("--knn_k must be positive")
+    selected_metrics = list(args.metrics or DEFAULT_RENDER_METRICS)
+    if args.threshold_quantiles:
+        unsupported = [
+            metric for metric in selected_metrics if metric not in STATIC_METRICS
+        ]
+        if unsupported:
+            raise ValueError(
+                "--threshold_quantiles currently requires static KNN metrics; "
+                f"unsupported metrics: {unsupported}"
+            )
     if not 0 <= args.percentile_min < args.percentile_max <= 100:
         raise ValueError("Expected 0 <= percentile_min < percentile_max <= 100")
     if args.value_min is not None and args.value_max is not None:

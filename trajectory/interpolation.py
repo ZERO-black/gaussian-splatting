@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation, Slerp
 
 
@@ -66,7 +67,7 @@ def interpolate_trajectory(
     intermediate_frames: int,
     up=None,
 ) -> np.ndarray:
-    """Insert smooth C2W poses between each pair of key cameras."""
+    """Interpolate positions globally with a cubic spline and rotations with SLERP."""
     if intermediate_frames < 0:
         raise ValueError("intermediate_frames must be non-negative")
 
@@ -81,7 +82,34 @@ def interpolate_trajectory(
         output.append(segment[:-1])
 
     output.append(poses_c2w[-1:].astype(np.float32))
-    return np.concatenate(output, axis=0)
+    interpolated = np.concatenate(output, axis=0)
+
+    # Pairwise linear interpolation changes velocity abruptly at every waypoint.
+    # A single natural cubic spline through all centers keeps position, velocity,
+    # and acceleration continuous while retaining the existing frame count and
+    # placing every waypoint at the same frame index as before.
+    frames_per_segment = intermediate_frames + 1
+    key_times = np.arange(len(poses_c2w), dtype=np.float64)
+    frame_times = np.linspace(
+        0.0,
+        float(len(poses_c2w) - 1),
+        (len(poses_c2w) - 1) * frames_per_segment + 1,
+        dtype=np.float64,
+    )
+    positions = np.asarray(poses_c2w, dtype=np.float64)[:, :3, 3]
+    position_spline = CubicSpline(
+        key_times,
+        positions,
+        axis=0,
+        bc_type="natural",
+    )
+    interpolated[:, :3, 3] = position_spline(frame_times).astype(np.float32)
+
+    # Preserve key camera centers bit-for-bit at their established frame slots.
+    interpolated[::frames_per_segment, :3, 3] = np.asarray(
+        poses_c2w, dtype=np.float32
+    )[:, :3, 3]
+    return interpolated
 
 
 def _rotations_with_fixed_up(rotations: np.ndarray, up) -> np.ndarray:

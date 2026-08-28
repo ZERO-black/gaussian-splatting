@@ -56,6 +56,41 @@ class CameraPairInterpolationTest(unittest.TestCase):
         self.assertEqual(frames.shape, (10, 4, 4))
         np.testing.assert_allclose(frames[:, 0, 3], np.arange(10) / 3, atol=1e-6)
 
+    def test_cubic_position_path_passes_through_every_waypoint(self):
+        poses = np.tile(np.eye(4, dtype=np.float32), (4, 1, 1))
+        poses[:, :2, 3] = [[0, 0], [1, 0], [1, 1], [2, 1]]
+        intermediate_frames = 5
+
+        frames = interpolate_trajectory(poses, intermediate_frames)
+
+        waypoint_stride = intermediate_frames + 1
+        np.testing.assert_array_equal(
+            frames[::waypoint_stride, :3, 3],
+            poses[:, :3, 3],
+        )
+
+    def test_cubic_position_path_removes_linear_corner_at_waypoint(self):
+        poses = np.tile(np.eye(4, dtype=np.float32), (3, 1, 1))
+        poses[:, :2, 3] = [[0, 0], [1, 0], [1, 1]]
+        intermediate_frames = 20
+
+        frames = interpolate_trajectory(poses, intermediate_frames)
+        waypoint_index = intermediate_frames + 1
+        incoming = (
+            frames[waypoint_index, :3, 3]
+            - frames[waypoint_index - 1, :3, 3]
+        )
+        outgoing = (
+            frames[waypoint_index + 1, :3, 3]
+            - frames[waypoint_index, :3, 3]
+        )
+        cosine = np.dot(incoming, outgoing) / (
+            np.linalg.norm(incoming) * np.linalg.norm(outgoing)
+        )
+        turn_degrees = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+        self.assertLess(turn_degrees, 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

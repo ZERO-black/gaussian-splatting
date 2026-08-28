@@ -209,6 +209,7 @@ def render_knn(
     bg_color: torch.Tensor,
     knn_values: torch.Tensor,
     scaling_modifier=1.0,
+    normalize_by_camera_distance=False,
 ):
     """Render a frozen scalar KNN cost while retaining camera-pose gradients."""
     expected_count = pc.get_xyz.shape[0]
@@ -246,7 +247,12 @@ def render_knn(
         debug=pipe.debug,
         antialiasing=pipe.antialiasing,
     )
-    rasterizer = CameraGaussianRasterizer(raster_settings=raster_settings)
+    rasterizer_class = (
+        GaussianRasterizer
+        if normalize_by_camera_distance
+        else CameraGaussianRasterizer
+    )
+    rasterizer = rasterizer_class(raster_settings=raster_settings)
 
     scales = None
     rotations = None
@@ -260,6 +266,12 @@ def render_knn(
     knn_colors = (
         knn_values.repeat(1, 3) if knn_values.shape[1] == 1 else knn_values
     )
+    if normalize_by_camera_distance:
+        knn_colors = normalize_knn_by_camera_distance(
+            knn_colors,
+            pc.get_xyz,
+            viewpoint_camera.camera_center,
+        )
     rendered_knn, radii, _ = rasterizer(
         means3D=pc.get_xyz,
         means2D=screenspace_points,
@@ -272,6 +284,95 @@ def render_knn(
     )
     return {
         "knn": rendered_knn[:1],
+        "knn_radii": radii,
         "knn_viewspace_points": screenspace_points,
         "knn_visibility_filter": radii > 0,
     }
+
+
+def multiply_knn_by_splat_radius(
+    knn_values: torch.Tensor,
+    splat_radii: torch.Tensor,
+) -> torch.Tensor:
+    """Multiply each Gaussian's KNN value by its CUDA-computed pixel radius."""
+    if knn_values.ndim != 2:
+        raise ValueError("knn_values must have shape [N, C]")
+    if splat_radii.ndim != 1 or splat_radii.shape[0] != knn_values.shape[0]:
+        raise ValueError("splat_radii must have shape [N]")
+    if not torch.isfinite(knn_values).all():
+        raise ValueError("knn_values contains non-finite values")
+    if (splat_radii < 0).any():
+        raise ValueError("splat_radii must be non-negative")
+    return knn_values * splat_radii.to(
+        dtype=knn_values.dtype,
+        device=knn_values.device,
+    ).unsqueeze(-1)
+
+
+def render_knn_times_splat_radius(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    knn_values: torch.Tensor,
+    scaling_modifier=1.0,
+):
+    """Render KNN multiplied by the projected radius from CUDA preprocessing."""
+    # forward.cu writes the projected integer pixel radius to radii[idx]. The
+    # radius is returned by the rasterizer but is not available until that pass
+    # finishes, so obtain it once and render the radius-weighted values again.
+    # Rendering ones over black also gives an alpha/coverage map at no extra pass.
+    with torch.no_grad():
+        radius_probe = render_knn(
+            viewpoint_camera,
+            pc,
+            pipe,
+            torch.zeros_like(bg_color),
+            torch.ones_like(knn_values),
+            scaling_modifier=scaling_modifier,
+            normalize_by_camera_distance=False,
+        )
+        splat_radii = radius_probe["knn_radii"]
+        coverage = radius_probe["knn"]
+        radius_weighted_knn = multiply_knn_by_splat_radius(
+            knn_values,
+            splat_radii,
+        )
+        del radius_probe
+
+    output = render_knn(
+        viewpoint_camera,
+        pc,
+        pipe,
+        bg_color,
+        radius_weighted_knn,
+        scaling_modifier=scaling_modifier,
+        normalize_by_camera_distance=False,
+    )
+    output["knn_splat_radii"] = splat_radii
+    output["knn_coverage"] = coverage
+    return output
+
+
+def normalize_knn_by_camera_distance(
+    knn_values: torch.Tensor,
+    gaussian_xyz: torch.Tensor,
+    camera_center: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Divide Gaussian KNN values by differentiable camera-center distance."""
+    if gaussian_xyz.ndim != 2 or gaussian_xyz.shape[1] != 3:
+        raise ValueError("gaussian_xyz must have shape [N, 3]")
+    if knn_values.ndim != 2 or knn_values.shape[0] != gaussian_xyz.shape[0]:
+        raise ValueError("knn_values must have shape [N, C]")
+    if camera_center.shape != (3,):
+        raise ValueError("camera_center must have shape [3]")
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+
+    camera_distance = torch.linalg.vector_norm(
+        gaussian_xyz - camera_center.unsqueeze(0),
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(eps)
+    return knn_values / camera_distance

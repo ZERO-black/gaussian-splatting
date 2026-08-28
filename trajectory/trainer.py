@@ -13,7 +13,12 @@ from gaussian_renderer import GaussianModel
 from scene import Scene
 from trajectory.interpolation import interpolate_trajectory
 from trajectory.io import resolve_camera_trajectory_path, save_trajectory
-from trajectory.losses import knn_loss
+from trajectory.losses import (
+    knn_loss,
+    roll_alignment_loss,
+    rotation_acceleration_loss,
+    tangent_alignment_loss,
+)
 from trajectory.model import TrainableTrajectory
 from trajectory.renderer import TrajectoryRenderer
 from utils.general_utils import safe_state
@@ -70,8 +75,21 @@ class TrajectoryTrainer:
             )
         if self.config.knn.k <= 0:
             raise ValueError("knn.k must be positive")
+        if not isinstance(self.config.knn.normalize_by_camera_distance, bool):
+            raise ValueError("knn.normalize_by_camera_distance must be boolean")
+        if (
+            not math.isfinite(float(self.config.knn.threshold))
+            or self.config.knn.threshold < 0
+        ):
+            raise ValueError("knn.threshold must be a finite non-negative value")
         if self.config.trajectory.intermediate_waypoints < 0:
             raise ValueError("trajectory.intermediate_waypoints must be non-negative")
+        if self.config.loss.roll_weight < 0:
+            raise ValueError("loss.roll_weight must be non-negative")
+        if self.config.loss.rotation_acceleration_weight < 0:
+            raise ValueError("loss.rotation_acceleration_weight must be non-negative")
+        if self.config.loss.tangent_weight < 0:
+            raise ValueError("loss.tangent_weight must be non-negative")
         if not 0.0 <= self.config.knn.background <= 1.0:
             raise ValueError("knn.background must be in [0, 1]")
         if (
@@ -122,7 +140,9 @@ class TrajectoryTrainer:
         OmegaConf.save(self.config, self.output_dir / "config.yaml")
         print(
             f"KNN objective: {property_name} from {self.knn_ply_path} "
-            f"(tail threshold={tail_threshold:g})"
+            f"(tail normalization={tail_threshold:g}, "
+            f"camera distance={self.config.knn.normalize_by_camera_distance}, "
+            f"rendered threshold={self.config.knn.threshold:g})"
         )
 
         if self.config.trajectory.camera_split == "train":
@@ -157,6 +177,10 @@ class TrajectoryTrainer:
                 device=self.device,
             ),
             knn_values=self.knn_values,
+            knn_normalize_by_camera_distance=(
+                self.config.knn.normalize_by_camera_distance
+            ),
+            knn_threshold=self.config.knn.threshold,
         )
 
     def _resolve_knn_ply(self, model_iteration: int) -> Path:
@@ -277,25 +301,40 @@ class TrajectoryTrainer:
         if self.trajectory_model.translation_delta.numel() > 0:
             translation_offset = self.trajectory_model.translation_delta.square().mean()
             rotation_offset = self.trajectory_model.rotation_delta.square().mean()
+            roll = roll_alignment_loss(
+                poses[1:-1, :3, :3],
+                -self.trajectory_model.initial_c2w[1:-1, :3, 1],
+            )
         else:
             translation_offset = positions.new_zeros(())
             rotation_offset = positions.new_zeros(())
+            roll = positions.new_zeros(())
         if len(positions) >= 3:
             acceleration = positions[2:] - 2.0 * positions[1:-1] + positions[:-2]
             acceleration_loss = acceleration.square().mean()
+            tangent = tangent_alignment_loss(positions)
+            rotation_acceleration = rotation_acceleration_loss(poses[:, :3, :3])
         else:
             acceleration_loss = positions.new_zeros(())
+            tangent = positions.new_zeros(())
+            rotation_acceleration = positions.new_zeros(())
 
         total_loss = (
             self.config.loss.translation_offset_weight * translation_offset
             + self.config.loss.rotation_offset_weight * rotation_offset
+            + self.config.loss.roll_weight * roll
             + self.config.loss.acceleration_weight * acceleration_loss
+            + self.config.loss.tangent_weight * tangent
+            + self.config.loss.rotation_acceleration_weight * rotation_acceleration
         )
         return {
             "total": total_loss,
             "translation_offset": translation_offset,
             "rotation_offset": rotation_offset,
+            "roll": roll,
             "acceleration": acceleration_loss,
+            "tangent": tangent,
+            "rotation_acceleration": rotation_acceleration,
         }
 
     def _backward_knn_one_camera_at_a_time(self) -> torch.Tensor:
@@ -361,7 +400,10 @@ class TrajectoryTrainer:
             "photometric": photometric_loss,
             "translation_offset": path_losses["translation_offset"].detach(),
             "rotation_offset": path_losses["rotation_offset"].detach(),
+            "roll": path_losses["roll"].detach(),
             "acceleration": path_losses["acceleration"].detach(),
+            "tangent": path_losses["tangent"].detach(),
+            "rotation_acceleration": path_losses["rotation_acceleration"].detach(),
         }
 
         renders = (

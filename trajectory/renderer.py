@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from gaussian_renderer import render, render_knn, render_uncertainty
 from scene.cameras import MiniCam
+from trajectory.losses import apply_knn_threshold
 from utils.graphics_utils import getProjectionMatrix
 
 
@@ -21,6 +22,8 @@ class TrajectoryRenderer:
         uncertainty_background: torch.Tensor = None,
         knn_background: torch.Tensor = None,
         knn_values: torch.Tensor = None,
+        knn_normalize_by_camera_distance: bool = False,
+        knn_threshold: float = 0.0,
     ):
         self.gaussians = gaussians
         self.pipeline = pipeline
@@ -30,6 +33,8 @@ class TrajectoryRenderer:
         self.knn_values = (
             knn_values.repeat(1, 3) if knn_values is not None else None
         )
+        self.knn_normalize_by_camera_distance = knn_normalize_by_camera_distance
+        self.knn_threshold = float(knn_threshold)
         self.uncertainty_sh = (
             gaussians.get_change_feature.repeat(1, 1, 3)
             if uncertainty_background is not None
@@ -178,13 +183,19 @@ class TrajectoryRenderer:
         if self.knn_background is None or self.knn_values is None:
             raise RuntimeError("KNN rendering is not configured")
         camera = _make_camera(pose_c2w, reference)
-        return render_knn(
+        output = render_knn(
             camera,
             self.gaussians,
             self.pipeline,
             self.knn_background,
             self.knn_values,
+            normalize_by_camera_distance=self.knn_normalize_by_camera_distance,
         )
+        output["knn_unthresholded"] = output["knn"]
+        output["knn"] = apply_knn_threshold(
+            output["knn"], self.knn_threshold
+        )
+        return output
 
 
 def _uncertainty_to_rgb_uint8(uncertainty: torch.Tensor) -> np.ndarray:
@@ -202,7 +213,10 @@ def _scalar_to_rgb_uint8(values: torch.Tensor, name: str) -> np.ndarray:
         .squeeze(0).contiguous().cpu().numpy()
     )
     bgr = cv2.applyColorMap(scalar, cv2.COLORMAP_TURBO)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if name == "knn":
+        rgb[scalar == 255] = (255, 0, 0)
+    return rgb
 
 
 def _make_camera(pose_c2w, reference) -> MiniCam:

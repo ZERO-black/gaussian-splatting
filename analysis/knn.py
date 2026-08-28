@@ -302,6 +302,50 @@ def percentile_label(percentile):
     return f"p{percentile:g}"
 
 
+def validate_distribution_quantiles(quantiles):
+    """Validate and canonicalize probabilities used as distribution thresholds."""
+    if quantiles is None:
+        return []
+
+    quantiles = sorted(set(float(quantile) for quantile in quantiles))
+    if any(not np.isfinite(quantile) or quantile < 0.0 or quantile > 1.0
+           for quantile in quantiles):
+        raise ValueError("Distribution quantiles must be finite values in [0, 1]")
+    return quantiles
+
+
+def distribution_quantile_label(quantile):
+    """Return a filesystem-friendly label such as q0p9 for probability 0.9."""
+    value = f"{float(quantile):.6g}"
+    return f"q{value.replace('.', 'p')}"
+
+
+def distribution_thresholds(values, quantiles):
+    """Resolve quantile probabilities to values from the finite distribution."""
+    quantiles = validate_distribution_quantiles(quantiles)
+    values = np.asarray(values).reshape(-1)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        raise ValueError("Cannot resolve thresholds from an empty distribution")
+    if not quantiles:
+        return {}
+
+    resolved = np.quantile(finite_values, quantiles)
+    return {
+        distribution_quantile_label(quantile): float(threshold)
+        for quantile, threshold in zip(quantiles, resolved)
+    }
+
+
+def apply_lower_threshold_plateau(values, threshold):
+    """Make every finite value below threshold share the threshold value."""
+    values = np.asarray(values)
+    result = values.copy()
+    finite = np.isfinite(result)
+    result[finite] = np.maximum(result[finite], threshold)
+    return result
+
+
 def describe(values, percentiles):
     percentile_values = np.percentile(values, percentiles)
     return {
