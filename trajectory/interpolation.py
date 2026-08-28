@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.interpolate import CubicSpline
-from scipy.spatial.transform import Rotation, Slerp
+from scipy.spatial.transform import Rotation, RotationSpline, Slerp
 
 
 def interpolate_camera_pair_linear(
@@ -67,7 +67,7 @@ def interpolate_trajectory(
     intermediate_frames: int,
     up=None,
 ) -> np.ndarray:
-    """Interpolate positions globally with a cubic spline and rotations with SLERP."""
+    """Interpolate positions and rotations with global smooth splines."""
     if intermediate_frames < 0:
         raise ValueError("intermediate_frames must be non-negative")
 
@@ -105,10 +105,25 @@ def interpolate_trajectory(
     )
     interpolated[:, :3, 3] = position_spline(frame_times).astype(np.float32)
 
-    # Preserve key camera centers bit-for-bit at their established frame slots.
-    interpolated[::frames_per_segment, :3, 3] = np.asarray(
-        poses_c2w, dtype=np.float32
-    )[:, :3, 3]
+    # Independent pairwise SLERP has a discontinuous angular velocity whenever
+    # adjacent waypoint intervals require different rotation amounts. A global
+    # RotationSpline retains every key rotation while smoothing those boundaries.
+    key_rotations = Rotation.from_matrix(
+        np.asarray(poses_c2w, dtype=np.float64)[:, :3, :3]
+    )
+    interpolated_rotations = RotationSpline(
+        key_times,
+        key_rotations,
+    )(frame_times).as_matrix()
+    if up is not None:
+        interpolated_rotations = _rotations_with_fixed_up(
+            interpolated_rotations,
+            up,
+        )
+    interpolated[:, :3, :3] = interpolated_rotations.astype(np.float32)
+
+    # Preserve key cameras bit-for-bit at their established frame slots.
+    interpolated[::frames_per_segment] = np.asarray(poses_c2w, dtype=np.float32)
     return interpolated
 
 

@@ -102,6 +102,38 @@ class SibrTrajectoryTest(unittest.TestCase):
             atol=1e-6,
         )
 
+    def test_spline_controls_generate_smooth_waypoint_deltas(self):
+        two_camera_path = Path(self.temp_directory.name) / "two_cameras.lookat"
+        two_camera_path.write_text("\n".join(SIBR_LOOKAT.splitlines()[:2]) + "\n")
+        model = TrainableTrajectory.from_file(
+            two_camera_path,
+            key="unused",
+            up=[0, -1, 0],
+            intermediate_waypoints=10,
+            spline_control_points=4,
+        )
+
+        self.assertEqual(model.translation_delta.shape, (4, 3))
+        self.assertEqual(model.rotation_delta.shape, (4, 3))
+        with torch.no_grad():
+            model.translation_delta[1, 1] = 1.0
+        waypoint_offsets = (
+            model().detach()[1:-1, :3, 3]
+            - model.initial_c2w[1:-1, :3, 3]
+        )
+
+        self.assertGreater(int((waypoint_offsets[:, 1] > 0).sum()), 1)
+        self.assertLess(
+            float(torch.diff(waypoint_offsets[:, 1], n=2).abs().max()),
+            0.35,
+        )
+
+        with torch.no_grad():
+            model.rotation_delta[2] = torch.tensor([0.1, -0.2, 0.05])
+        all_poses = model()
+        for index in range(len(all_poses)):
+            torch.testing.assert_close(model(index), all_poses[index])
+
     def test_sibr_lookat_writer_round_trip_with_fixed_up(self):
         up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         poses = np.tile(np.eye(4, dtype=np.float32), (2, 1, 1))

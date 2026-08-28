@@ -3,6 +3,7 @@ from typing import Optional, Union
 
 import numpy as np
 import torch
+from scipy.interpolate import BSpline
 from torch import nn
 
 from .interpolation import interpolate_camera_pair_linear
@@ -36,10 +37,40 @@ def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _spline_delta_basis(
+    num_waypoints: int,
+    num_control_points: int,
+) -> np.ndarray:
+    """Map smooth interior B-spline controls to interior waypoint deltas."""
+    if num_waypoints < 1:
+        raise ValueError("num_waypoints must be positive")
+    if num_control_points < 1:
+        raise ValueError("num_control_points must be positive")
+
+    # Two additional, fixed zero controls anchor both endpoint deltas. The
+    # trainable controls therefore describe broad changes to the whole path
+    # instead of allowing every waypoint to move independently.
+    total_controls = num_control_points + 2
+    degree = min(3, total_controls - 1)
+    internal_knots = total_controls - degree - 1
+    knots = np.concatenate(
+        (
+            np.zeros(degree + 1),
+            np.linspace(0.0, 1.0, internal_knots + 2)[1:-1],
+            np.ones(degree + 1),
+        )
+    )
+    control_basis = np.eye(total_controls, dtype=np.float64)
+    sample_times = np.linspace(0.0, 1.0, num_waypoints + 2)[1:-1]
+    basis = BSpline(knots, control_basis, degree)(sample_times)
+    return basis[:, 1:-1].astype(np.float32)
+
+
 class TrainableTrajectory(nn.Module):
     def __init__(
         self,
         initial_c2w: Union[np.ndarray, torch.Tensor],
+        spline_control_points: Optional[int] = None,
     ):
         super().__init__()
         initial_c2w = torch.as_tensor(initial_c2w, dtype=torch.float32)
@@ -47,8 +78,33 @@ class TrainableTrajectory(nn.Module):
 
         self.register_buffer("initial_c2w", initial_c2w.clone())
         num_interior = initial_c2w.shape[0] - 2
-        self.translation_delta = nn.Parameter(initial_c2w.new_zeros(num_interior, 3))
-        self.rotation_delta = nn.Parameter(initial_c2w.new_zeros(num_interior, 3))
+        if spline_control_points is not None and (
+            isinstance(spline_control_points, bool)
+            or not isinstance(spline_control_points, int)
+            or spline_control_points < 1
+        ):
+            raise ValueError(
+                "spline_control_points must be a positive integer when provided"
+            )
+
+        num_controls = (
+            min(spline_control_points, num_interior)
+            if spline_control_points is not None and num_interior > 0
+            else num_interior
+        )
+        if spline_control_points is None or num_interior == 0:
+            delta_basis = torch.eye(
+                num_interior,
+                dtype=initial_c2w.dtype,
+                device=initial_c2w.device,
+            )
+        else:
+            delta_basis = initial_c2w.new_tensor(
+                _spline_delta_basis(num_interior, num_controls)
+            )
+        self.register_buffer("delta_basis", delta_basis)
+        self.translation_delta = nn.Parameter(initial_c2w.new_zeros(num_controls, 3))
+        self.rotation_delta = nn.Parameter(initial_c2w.new_zeros(num_controls, 3))
 
     @classmethod
     def from_file(
@@ -59,6 +115,7 @@ class TrainableTrajectory(nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         direction_key: Optional[str] = None,
         intermediate_waypoints: int = 0,
+        spline_control_points: Optional[int] = None,
     ) -> "TrainableTrajectory":
         resolved_path = resolve_camera_trajectory_path(path)
         initial_c2w = load_camera_trajectory(
@@ -76,7 +133,7 @@ class TrainableTrajectory(nn.Module):
                 intermediate_waypoints,
                 up=None,
             )
-        trajectory = cls(initial_c2w)
+        trajectory = cls(initial_c2w, spline_control_points=spline_control_points)
         return trajectory.to(device) if device is not None else trajectory
 
     @classmethod
@@ -88,6 +145,7 @@ class TrainableTrajectory(nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         direction_key: Optional[str] = None,
         intermediate_waypoints: int = 0,
+        spline_control_points: Optional[int] = None,
     ) -> "TrainableTrajectory":
         """Backward-compatible alias for NPZ and SIBR trajectory inputs."""
         return cls.from_file(
@@ -97,6 +155,7 @@ class TrainableTrajectory(nn.Module):
             device,
             direction_key,
             intermediate_waypoints,
+            spline_control_points,
         )
 
     @staticmethod
@@ -114,11 +173,13 @@ class TrainableTrajectory(nn.Module):
 
     def all_poses(self) -> torch.Tensor:
         initial_interior = self.initial_c2w[1:-1]
+        translation_delta = self.delta_basis @ self.translation_delta
+        rotation_delta = self.delta_basis @ self.rotation_delta
         proposed_rotation = (
             initial_interior[:, :3, :3]
-            @ _axis_angle_to_matrix(self.rotation_delta)
+            @ _axis_angle_to_matrix(rotation_delta)
         )
-        corrected_center = initial_interior[:, :3, 3] + self.translation_delta
+        corrected_center = initial_interior[:, :3, 3] + translation_delta
 
         bottom_row = initial_interior[:, 3:4, :]
         interior_c2w = torch.cat(
@@ -149,12 +210,14 @@ class TrainableTrajectory(nn.Module):
 
         delta_index = index - 1
         initial_pose = self.initial_c2w[index]
+        translation_delta = self.delta_basis[delta_index] @ self.translation_delta
+        rotation_delta = self.delta_basis[delta_index] @ self.rotation_delta
         proposed_rotation = (
             initial_pose[:3, :3]
-            @ _axis_angle_to_matrix(self.rotation_delta[delta_index])
+            @ _axis_angle_to_matrix(rotation_delta)
         )
         corrected_center = (
-            initial_pose[:3, 3] + self.translation_delta[delta_index]
+            initial_pose[:3, 3] + translation_delta
         )
         return torch.cat(
             (

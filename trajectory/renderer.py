@@ -5,7 +5,12 @@ import torch
 import torchvision
 from tqdm import tqdm
 
-from gaussian_renderer import render, render_knn, render_uncertainty
+from gaussian_renderer import (
+    render,
+    render_knn,
+    render_knn_times_splat_radius,
+    render_uncertainty,
+)
 from scene.cameras import MiniCam
 from trajectory.losses import apply_knn_threshold
 from utils.graphics_utils import getProjectionMatrix
@@ -23,6 +28,7 @@ class TrajectoryRenderer:
         knn_background: torch.Tensor = None,
         knn_values: torch.Tensor = None,
         knn_normalize_by_camera_distance: bool = False,
+        knn_multiply_by_splat_radius: bool = False,
         knn_threshold: float = 0.0,
     ):
         self.gaussians = gaussians
@@ -34,6 +40,7 @@ class TrajectoryRenderer:
             knn_values.repeat(1, 3) if knn_values is not None else None
         )
         self.knn_normalize_by_camera_distance = knn_normalize_by_camera_distance
+        self.knn_multiply_by_splat_radius = knn_multiply_by_splat_radius
         self.knn_threshold = float(knn_threshold)
         self.uncertainty_sh = (
             gaussians.get_change_feature.repeat(1, 1, 3)
@@ -77,7 +84,12 @@ class TrajectoryRenderer:
         output_dir.mkdir(parents=True, exist_ok=True)
         for index, pose in enumerate(tqdm(poses_c2w, desc="Waypoint KNN cost")):
             knn_map = self.render_knn_pose(pose, reference_camera)["knn"]
-            knn_rgb = _scalar_to_rgb_uint8(knn_map, "knn")
+            knn_rgb = _scalar_to_rgb_uint8(
+                knn_map,
+                "knn",
+                value_min=self.knn_threshold,
+                value_max=float(self.knn_background[0].item()),
+            )
             cv2.imwrite(
                 str(output_dir / f"{index:05d}.png"),
                 cv2.cvtColor(knn_rgb, cv2.COLOR_RGB2BGR),
@@ -137,7 +149,12 @@ class TrajectoryRenderer:
                     frame_rgb = _uncertainty_to_rgb_uint8(uncertainty)
                 else:
                     knn_map = self.render_knn_pose(pose, reference_camera)["knn"]
-                    frame_rgb = _scalar_to_rgb_uint8(knn_map, "knn")
+                    frame_rgb = _scalar_to_rgb_uint8(
+                        knn_map,
+                        "knn",
+                        value_min=self.knn_threshold,
+                        value_max=float(self.knn_background[0].item()),
+                    )
                 if frame_rgb.shape[1::-1] != size:
                     raise ValueError("All reference cameras must have the same resolution")
                 writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
@@ -183,14 +200,23 @@ class TrajectoryRenderer:
         if self.knn_background is None or self.knn_values is None:
             raise RuntimeError("KNN rendering is not configured")
         camera = _make_camera(pose_c2w, reference)
-        output = render_knn(
-            camera,
-            self.gaussians,
-            self.pipeline,
-            self.knn_background,
-            self.knn_values,
-            normalize_by_camera_distance=self.knn_normalize_by_camera_distance,
-        )
+        if self.knn_multiply_by_splat_radius:
+            output = render_knn_times_splat_radius(
+                camera,
+                self.gaussians,
+                self.pipeline,
+                self.knn_background,
+                self.knn_values,
+            )
+        else:
+            output = render_knn(
+                camera,
+                self.gaussians,
+                self.pipeline,
+                self.knn_background,
+                self.knn_values,
+                normalize_by_camera_distance=self.knn_normalize_by_camera_distance,
+            )
         output["knn_unthresholded"] = output["knn"]
         output["knn"] = apply_knn_threshold(
             output["knn"], self.knn_threshold
@@ -203,13 +229,23 @@ def _uncertainty_to_rgb_uint8(uncertainty: torch.Tensor) -> np.ndarray:
     return _scalar_to_rgb_uint8(uncertainty, "uncertainty")
 
 
-def _scalar_to_rgb_uint8(values: torch.Tensor, name: str) -> np.ndarray:
+def _scalar_to_rgb_uint8(
+    values: torch.Tensor,
+    name: str,
+    value_min: float = 0.0,
+    value_max: float = 1.0,
+) -> np.ndarray:
     if values.ndim != 3 or values.shape[0] != 1:
         raise ValueError(
             f"{name} must have shape [1, height, width], got {tuple(values.shape)}"
         )
+    if not np.isfinite(value_min) or not np.isfinite(value_max):
+        raise ValueError("Visualization bounds must be finite")
+    if value_max <= value_min:
+        raise ValueError("Visualization maximum must be greater than minimum")
     scalar = (
-        values.detach().clamp(0, 1).mul(255).byte()
+        ((values.detach() - value_min) / (value_max - value_min))
+        .clamp(0, 1).mul(255).byte()
         .squeeze(0).contiguous().cpu().numpy()
     )
     bgr = cv2.applyColorMap(scalar, cv2.COLORMAP_TURBO)

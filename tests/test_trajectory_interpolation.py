@@ -91,6 +91,55 @@ class CameraPairInterpolationTest(unittest.TestCase):
 
         self.assertLess(turn_degrees, 10.0)
 
+    def test_rotation_spline_smooths_angular_velocity_at_waypoint(self):
+        poses = np.tile(np.eye(4, dtype=np.float32), (3, 1, 1))
+        poses[:, :3, :3] = Rotation.from_euler(
+            "y", [0.0, 10.0, 80.0], degrees=True
+        ).as_matrix()
+        intermediate_frames = 19
+
+        frames = interpolate_trajectory(poses, intermediate_frames)
+        relative = np.einsum(
+            "nij,njk->nik",
+            np.transpose(frames[:-1, :3, :3], (0, 2, 1)),
+            frames[1:, :3, :3],
+        )
+        angular_steps = np.degrees(
+            np.arccos(
+                np.clip(
+                    (np.trace(relative, axis1=1, axis2=2) - 1.0) / 2.0,
+                    -1.0,
+                    1.0,
+                )
+            )
+        )
+        waypoint_boundary = intermediate_frames
+
+        # Pairwise SLERP would jump directly from 0.5 to 3.5 degrees/frame.
+        self.assertLess(
+            abs(
+                angular_steps[waypoint_boundary + 1]
+                - angular_steps[waypoint_boundary]
+            ),
+            0.5,
+        )
+
+    def test_rotation_spline_preserves_key_rotations(self):
+        poses = np.tile(np.eye(4, dtype=np.float32), (4, 1, 1))
+        poses[:, :3, :3] = Rotation.from_euler(
+            "xyz",
+            [[0, 0, 0], [10, 20, 5], [-5, 40, 15], [20, 60, 0]],
+            degrees=True,
+        ).as_matrix()
+        intermediate_frames = 4
+
+        frames = interpolate_trajectory(poses, intermediate_frames)
+
+        np.testing.assert_array_equal(
+            frames[::intermediate_frames + 1],
+            poses,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

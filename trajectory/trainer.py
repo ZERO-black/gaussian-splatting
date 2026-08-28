@@ -77,6 +77,15 @@ class TrajectoryTrainer:
             raise ValueError("knn.k must be positive")
         if not isinstance(self.config.knn.normalize_by_camera_distance, bool):
             raise ValueError("knn.normalize_by_camera_distance must be boolean")
+        if not isinstance(self.config.knn.multiply_by_splat_radius, bool):
+            raise ValueError("knn.multiply_by_splat_radius must be boolean")
+        if (
+            self.config.knn.normalize_by_camera_distance
+            and self.config.knn.multiply_by_splat_radius
+        ):
+            raise ValueError(
+                "KNN camera-distance and splat-radius weighting are mutually exclusive"
+            )
         if (
             not math.isfinite(float(self.config.knn.threshold))
             or self.config.knn.threshold < 0
@@ -84,14 +93,33 @@ class TrajectoryTrainer:
             raise ValueError("knn.threshold must be a finite non-negative value")
         if self.config.trajectory.intermediate_waypoints < 0:
             raise ValueError("trajectory.intermediate_waypoints must be non-negative")
+        spline_control_points = getattr(
+            self.config.trajectory,
+            "spline_control_points",
+            None,
+        )
+        if (
+            spline_control_points is not None
+            and (
+                not isinstance(spline_control_points, int)
+                or isinstance(spline_control_points, bool)
+                or spline_control_points < 1
+            )
+        ):
+            raise ValueError(
+                "trajectory.spline_control_points must be a positive integer or null"
+            )
         if self.config.loss.roll_weight < 0:
             raise ValueError("loss.roll_weight must be non-negative")
         if self.config.loss.rotation_acceleration_weight < 0:
             raise ValueError("loss.rotation_acceleration_weight must be non-negative")
         if self.config.loss.tangent_weight < 0:
             raise ValueError("loss.tangent_weight must be non-negative")
-        if not 0.0 <= self.config.knn.background <= 1.0:
-            raise ValueError("knn.background must be in [0, 1]")
+        if (
+            not math.isfinite(float(self.config.knn.background))
+            or self.config.knn.background < 0
+        ):
+            raise ValueError("knn.background must be a finite non-negative value")
         if (
             self.config.knn.tail_threshold is not None
             and self.config.knn.tail_threshold <= 0
@@ -142,6 +170,7 @@ class TrajectoryTrainer:
             f"KNN objective: {property_name} from {self.knn_ply_path} "
             f"(tail normalization={tail_threshold:g}, "
             f"camera distance={self.config.knn.normalize_by_camera_distance}, "
+            f"splat radius={self.config.knn.multiply_by_splat_radius}, "
             f"rendered threshold={self.config.knn.threshold:g})"
         )
 
@@ -179,6 +208,9 @@ class TrajectoryTrainer:
             knn_values=self.knn_values,
             knn_normalize_by_camera_distance=(
                 self.config.knn.normalize_by_camera_distance
+            ),
+            knn_multiply_by_splat_radius=(
+                self.config.knn.multiply_by_splat_radius
             ),
             knn_threshold=self.config.knn.threshold,
         )
@@ -250,6 +282,11 @@ class TrajectoryTrainer:
     def _setup_trajectory(self) -> None:
         resolved_path = resolve_camera_trajectory_path(self.config.trajectory.path)
         self.trajectory_uses_saved_up = resolved_path.suffix.lower() == ".lookat"
+        spline_control_points = getattr(
+            self.config.trajectory,
+            "spline_control_points",
+            None,
+        )
         self.trajectory_model = TrainableTrajectory.from_file(
             resolved_path,
             self.config.trajectory.key,
@@ -257,6 +294,7 @@ class TrajectoryTrainer:
             device=self.device,
             direction_key=self.config.trajectory.direction_key,
             intermediate_waypoints=self.config.trajectory.intermediate_waypoints,
+            spline_control_points=spline_control_points,
         )
 
     def _setup_optimizer(self) -> None:
