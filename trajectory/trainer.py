@@ -36,9 +36,18 @@ class TrajectoryTrainer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device(config.runtime.device)
+        output_root = Path(config.output.directory).expanduser()
+        run_name = getattr(config.output, "run_name", None)
+        if run_name is not None:
+            run_name = str(run_name)
+            if (
+                not run_name
+                or Path(run_name).name != run_name
+                or run_name in {".", ".."}
+            ):
+                raise ValueError("output.run_name must be a single non-empty path name")
         self.output_dir = (
-            Path(config.output.directory).expanduser()
-            / time.strftime("%Y-%m-%d_%H-%M-%S")
+            output_root / (run_name or time.strftime("%Y-%m-%d_%H-%M-%S"))
         ).resolve()
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.preview_dir = self.output_dir / "previews"
@@ -127,6 +136,10 @@ class TrajectoryTrainer:
             raise ValueError("knn.tail_threshold must be positive when provided")
 
     def _prepare_output(self) -> None:
+        if self.output_dir.exists() and any(self.output_dir.iterdir()):
+            raise FileExistsError(
+                f"Trajectory output directory is not empty: {self.output_dir}"
+            )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.preview_dir.mkdir(parents=True, exist_ok=True)

@@ -39,7 +39,7 @@ knn:
 trajectory:
   # Use the .lookat file produced by SIBR's "Save key cameras..." action.
   # Legacy NPZ trajectories remain supported.
-  path: ./cameras/bicycle/0188.lookat
+  path: ./cameras/bicycle/0171.lookat
   # When the input contains only start/end cameras, create this many trainable
   # waypoints between them before optimization.
   intermediate_waypoints: 10
@@ -71,7 +71,7 @@ loss:
   rotation_acceleration_weight: 1000.0
 
 checkpoint:
-  interval: 50
+  interval: 200
   resume: null
   intermediate_frames: 10
   fps: 30
@@ -91,3 +91,5 @@ runtime:
 
 output:
   directory: ./output/trajectory_train
+  # Optional exact directory name below output.directory. null uses a timestamp.
+  run_name: null
