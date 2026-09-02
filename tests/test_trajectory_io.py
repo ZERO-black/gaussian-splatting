@@ -76,6 +76,19 @@ class SibrTrajectoryTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(model.translation_delta.grad).all())
         self.assertTrue(torch.isfinite(model.rotation_delta.grad).all())
 
+    def test_loads_canonical_poses_directly_from_npz(self):
+        poses = load_sibr_lookat_trajectory(self.path)
+        pose_path = Path(self.temp_directory.name) / "poses.npz"
+        np.savez_compressed(pose_path, poses_c2w=poses)
+
+        loaded = load_camera_trajectory(
+            pose_path,
+            key="poses_c2w",
+            up=[0, 0, 1],
+        )
+
+        np.testing.assert_array_equal(loaded, poses)
+
     def test_optimizer_adds_trainable_waypoints_for_two_camera_input(self):
         two_camera_path = Path(self.temp_directory.name) / "two_cameras.lookat"
         two_camera_path.write_text("\n".join(SIBR_LOOKAT.splitlines()[:2]) + "\n")

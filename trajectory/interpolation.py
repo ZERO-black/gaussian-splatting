@@ -122,8 +122,18 @@ def interpolate_trajectory(
         )
     interpolated[:, :3, :3] = interpolated_rotations.astype(np.float32)
 
-    # Preserve key cameras bit-for-bit at their established frame slots.
-    interpolated[::frames_per_segment] = np.asarray(poses_c2w, dtype=np.float32)
+    source_poses = np.asarray(poses_c2w, dtype=np.float32)
+    keyframe_slice = slice(None, None, frames_per_segment)
+    if up is None:
+        # Without a horizon constraint, preserve source key cameras bit-for-bit.
+        interpolated[keyframe_slice] = source_poses
+    else:
+        # The fixed-up rotation above deliberately removes roll while preserving
+        # each keyframe's forward direction (including pitch). Restoring the
+        # original full rotation here would insert one-frame roll spikes at every
+        # optimized waypoint. Positions and homogeneous rows remain exact.
+        interpolated[keyframe_slice, :3, 3] = source_poses[:, :3, 3]
+        interpolated[keyframe_slice, 3] = source_poses[:, 3]
     return interpolated
 
 
@@ -139,18 +149,26 @@ def _rotations_with_fixed_up(rotations: np.ndarray, up) -> np.ndarray:
 
     forward = rotations[:, :, 2]
     forward = forward / np.linalg.norm(forward, axis=1, keepdims=True)
-    forward = forward - (forward @ up)[:, None] * up[None]
-    parallel_forward = np.linalg.norm(forward, axis=1) < 1e-6
-    if parallel_forward.any():
-        fallback_axis = np.eye(3)[np.argmin(np.abs(up))]
-        fallback_forward = fallback_axis - np.dot(fallback_axis, up) * up
-        forward[parallel_forward] = fallback_forward
-    forward = forward / np.linalg.norm(forward, axis=1, keepdims=True)
     right = np.cross(forward, np.broadcast_to(up, forward.shape))
     parallel = np.linalg.norm(right, axis=1) < 1e-6
     if parallel.any():
-        fallback = np.eye(3)[np.argmin(np.abs(forward[parallel]), axis=1)]
-        right[parallel] = np.cross(forward[parallel], fallback)
+        # Roll is undefined when looking exactly along world-up. Preserve the
+        # interpolated camera-right axis after projecting it perpendicular to
+        # forward instead of changing the viewing direction.
+        fallback_right = rotations[parallel, :, 0]
+        fallback_right = fallback_right - (
+            fallback_right * forward[parallel]
+        ).sum(axis=1, keepdims=True) * forward[parallel]
+        fallback_norm = np.linalg.norm(fallback_right, axis=1)
+        degenerate = fallback_norm < 1e-6
+        if degenerate.any():
+            fallback_axis = np.eye(3)[
+                np.argmin(np.abs(forward[parallel][degenerate]), axis=1)
+            ]
+            fallback_right[degenerate] = np.cross(
+                forward[parallel][degenerate], fallback_axis
+            )
+        right[parallel] = fallback_right
     right = right / np.linalg.norm(right, axis=1, keepdims=True)
     down = np.cross(forward, right)
     return np.stack((right, down, forward), axis=-1)

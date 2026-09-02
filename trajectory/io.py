@@ -184,6 +184,10 @@ def load_kaolin_camera_trajectory(
         if key not in archive:
             raise KeyError(f"{path} has no {key!r}; available keys: {archive.files}")
         positions = np.asarray(archive[key], dtype=np.float32)
+        if positions.ndim == 3 and positions.shape[1:] == (4, 4):
+            poses_c2w = positions.copy()
+            _validate_c2w(poses_c2w)
+            return poses_c2w
         resolved_direction_key = direction_key
         automatic_direction_key = f"{key}_directions"
         if resolved_direction_key is None and automatic_direction_key in archive:

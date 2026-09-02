@@ -140,6 +140,63 @@ class CameraPairInterpolationTest(unittest.TestCase):
             poses,
         )
 
+    def test_fixed_up_removes_roll_without_resetting_pitch_at_keyframes(self):
+        up = np.array([0.0, 0.0, 1.0])
+        pitches = np.deg2rad([0.0, -30.0, 0.0])
+        poses = np.tile(np.eye(4, dtype=np.float32), (3, 1, 1))
+        for index, pitch in enumerate(pitches):
+            forward = np.array([0.0, np.cos(pitch), np.sin(pitch)])
+            right = np.cross(forward, up)
+            right /= np.linalg.norm(right)
+            down = np.cross(forward, right)
+            poses[index, :3, :3] = np.stack((right, down, forward), axis=1)
+
+        frames = interpolate_trajectory(poses, intermediate_frames=10, up=up)
+        forward_pitch = np.rad2deg(np.arcsin(frames[:, 2, 2]))
+
+        self.assertAlmostEqual(float(forward_pitch[11]), -30.0, places=4)
+        self.assertLess(float(np.max(np.abs(np.diff(forward_pitch)))), 5.0)
+        np.testing.assert_allclose(
+            frames[:, :3, 2] / np.linalg.norm(frames[:, :3, 2], axis=1)[:, None],
+            frames[:, :3, 2],
+            atol=1e-6,
+        )
+
+    def test_fixed_up_does_not_restore_one_frame_roll_spikes(self):
+        up = np.array([0.0, 0.0, 1.0])
+        poses = np.tile(np.eye(4, dtype=np.float32), (3, 1, 1))
+        for index, (yaw_degrees, roll_degrees) in enumerate(
+            [(0.0, 0.0), (10.0, 35.0), (20.0, 0.0)]
+        ):
+            yaw = np.deg2rad(yaw_degrees)
+            pitch = np.deg2rad(-10.0)
+            forward = np.array(
+                [
+                    np.sin(yaw) * np.cos(pitch),
+                    np.cos(yaw) * np.cos(pitch),
+                    np.sin(pitch),
+                ]
+            )
+            right = np.cross(forward, up)
+            right /= np.linalg.norm(right)
+            down = np.cross(forward, right)
+            base = np.stack((right, down, forward), axis=1)
+            local_roll = Rotation.from_rotvec(
+                [0.0, 0.0, np.deg2rad(roll_degrees)]
+            ).as_matrix()
+            poses[index, :3, :3] = base @ local_roll
+
+        frames = interpolate_trajectory(poses, intermediate_frames=10, up=up)
+        relative = np.einsum(
+            "nij,njk->nik",
+            np.transpose(frames[:-1, :3, :3], (0, 2, 1)),
+            frames[1:, :3, :3],
+        )
+        angular_steps = np.rad2deg(Rotation.from_matrix(relative).magnitude())
+
+        self.assertLess(float(angular_steps.max()), 5.0)
+        np.testing.assert_array_equal(frames[::11, :3, 3], poses[:, :3, 3])
+
 
 if __name__ == "__main__":
     unittest.main()
