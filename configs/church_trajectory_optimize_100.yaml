@@ -1,0 +1,87 @@
+model:
+  source_path: null
+  model_path: ./models/church
+  camera_json: ./models/church/camera.json
+  znear: 0.1
+  zfar: 1000.0
+  iteration: 30000
+  sh_degree: 3
+  images: images
+  depths: ""
+  resolution: -1
+  white_background: false
+  train_test_exp: false
+  data_device: cuda
+  eval: false
+
+knn:
+  ply_path: ./models/church/knn_analysis/iteration_30000/point_cloud_knn.ply
+  metric: mean
+  k: 10
+  tail_threshold: null
+  background: 1.0
+  normalize_by_camera_distance: true
+  multiply_by_splat_radius: false
+  threshold: 0.0
+
+trajectory:
+  # Replaced by every navigation_XXXX.npz in the batch script.
+  path: ./cameras/church/random_100_v2/navigation_0001.npz
+  intermediate_waypoints: 0
+  spline_control_points: 4
+  key: poses_c2w
+  direction_key: null
+  up: [0.0, 0.0, 1.0]
+  camera_split: train
+  reference_camera_index: 0
+
+optimization:
+  iterations: 200
+  translation_lr: 0.005
+  rotation_lr: 0.005
+
+loss:
+  knn_weight: 1000.0
+  photometric_weight: 0.0
+  translation_offset_weight: 100.0
+  rotation_offset_weight: 0.0
+  roll_weight: 10.0
+  acceleration_weight: 3000.0
+  tangent_weight: 10000.0
+  rotation_acceleration_weight: 1000.0
+
+checkpoint:
+  # Lightweight state is resumable every 50 iterations. Expensive RGB/KNN
+  # comparison videos are produced only at iteration 0 and the final iteration.
+  interval: 50
+  preview_interval: 200
+  resume: null
+  intermediate_frames: 10
+  fps: 30
+  codec: mp4v
+
+logging:
+  wandb:
+    enabled: false
+    project: 3dgs-camera-gradient
+    entity: null
+    name: null
+    mode: offline
+
+runtime:
+  device: cuda
+  quiet: false
+
+output:
+  directory: ./output/church_random_100_v2_optimization
+  run_name: unused
+
+batch:
+  input_dir: ./cameras/church/random_100_v2
+  input_glob: navigation_*.npz
+  expected_count: 100
+  output_dir: ./output/church_random_100_v2_optimization
+  manifest_filename: manifest.json
+  skip_completed: true
+  resume_incomplete: true
+  continue_on_error: false

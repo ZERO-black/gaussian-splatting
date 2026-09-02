@@ -1,6 +1,7 @@
 import json
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -20,6 +21,7 @@ from trajectory.losses import (
     tangent_alignment_loss,
 )
 from trajectory.model import TrainableTrajectory
+from trajectory.reference_camera import load_reference_cameras
 from trajectory.renderer import TrajectoryRenderer
 from utils.general_utils import safe_state
 from utils.system_utils import searchForMaxIteration
@@ -30,10 +32,24 @@ except ImportError:
     wandb = None
 
 
+@dataclass
+class TrajectorySceneContext:
+    """Frozen scene state that can be reused across trajectory optimizations."""
+
+    gaussians: object
+    scene: object
+    knn_ply_path: Path
+    knn_values: torch.Tensor
+    knn_tail_threshold: float
+    reference_camera: object
+    background: torch.Tensor
+    renderer: TrajectoryRenderer
+
+
 class TrajectoryTrainer:
     """Optimize a camera trajectory while keeping all Gaussians frozen."""
 
-    def __init__(self, config):
+    def __init__(self, config, shared_scene: TrajectorySceneContext = None):
         self.config = config
         self.device = torch.device(config.runtime.device)
         output_root = Path(config.output.directory).expanduser()
@@ -56,7 +72,10 @@ class TrajectoryTrainer:
 
         self._validate_config()
         self._prepare_output()
-        self._setup_scene()
+        if shared_scene is None:
+            self._setup_scene()
+        else:
+            self._reuse_scene(shared_scene)
         self._setup_trajectory()
         self._setup_optimizer()
         self._setup_logger()
@@ -69,6 +88,15 @@ class TrajectoryTrainer:
             raise ValueError("optimization.iterations must be positive")
         if self.config.checkpoint.interval < 1:
             raise ValueError("checkpoint.interval must be positive")
+        preview_interval = int(
+            getattr(
+                self.config.checkpoint,
+                "preview_interval",
+                self.config.checkpoint.interval,
+            )
+        )
+        if preview_interval < 1:
+            raise ValueError("checkpoint.preview_interval must be positive")
         if self.config.checkpoint.intermediate_frames < 0:
             raise ValueError("checkpoint.intermediate_frames must be non-negative")
         if self.config.checkpoint.fps < 1:
@@ -137,9 +165,18 @@ class TrajectoryTrainer:
 
     def _prepare_output(self) -> None:
         if self.output_dir.exists() and any(self.output_dir.iterdir()):
-            raise FileExistsError(
-                f"Trajectory output directory is not empty: {self.output_dir}"
-            )
+            resume = self.config.checkpoint.resume
+            if resume is None:
+                raise FileExistsError(
+                    f"Trajectory output directory is not empty: {self.output_dir}"
+                )
+            resume_path = Path(resume).expanduser().resolve()
+            checkpoint_dir = (self.output_dir / "checkpoints").resolve()
+            if resume_path.parent != checkpoint_dir or not resume_path.is_file():
+                raise FileExistsError(
+                    "A non-empty output directory can only resume one of its own "
+                    f"checkpoints: {self.output_dir}"
+                )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.preview_dir.mkdir(parents=True, exist_ok=True)
@@ -148,22 +185,41 @@ class TrajectoryTrainer:
 
     def _setup_scene(self) -> None:
         safe_state(self.config.runtime.quiet)
+        camera_json = getattr(self.config.model, "camera_json", None)
+        standalone = camera_json is not None
         model_iteration = self.config.model.iteration
-        if model_iteration == -1:
+        if model_iteration == -1 and not standalone:
             model_iteration = searchForMaxIteration(
                 str(Path(self.config.model.model_path) / "point_cloud")
             )
         self.knn_ply_path = self._resolve_knn_ply(model_iteration)
 
         self.gaussians = GaussianModel(self.config.model.sh_degree)
-        self.scene = Scene(
-            self.config.model,
-            self.gaussians,
-            load_iteration=model_iteration,
-            shuffle=False,
-            load_ply_path=str(self.knn_ply_path),
-            load_camera_images=False,
-        )
+        if standalone:
+            self.scene = None
+            self.gaussians.load_ply(
+                str(self.knn_ply_path), self.config.model.train_test_exp
+            )
+            cameras = load_reference_cameras(
+                camera_json,
+                znear=float(getattr(self.config.model, "znear", 0.01)),
+                zfar=float(getattr(self.config.model, "zfar", 1000.0)),
+            )
+        else:
+            self.scene = Scene(
+                self.config.model,
+                self.gaussians,
+                load_iteration=model_iteration,
+                shuffle=False,
+                load_ply_path=str(self.knn_ply_path),
+                load_camera_images=False,
+            )
+            if self.config.trajectory.camera_split == "train":
+                cameras = self.scene.getTrainCameras()
+            elif self.config.trajectory.camera_split == "test":
+                cameras = self.scene.getTestCameras()
+            else:
+                raise ValueError("trajectory.camera_split must be 'train' or 'test'")
         self._freeze_gaussians()
 
         property_name = ply_property_name(self.config.knn.metric, self.config.knn.k)
@@ -174,6 +230,7 @@ class TrajectoryTrainer:
                 f"KNN metric {property_name!r} is missing from {self.knn_ply_path}"
             ) from exc
         tail_threshold = self._resolve_tail_threshold(property_name)
+        self.knn_tail_threshold = tail_threshold
         self.knn_values = torch.clamp(raw_knn_values / tail_threshold, 0.0, 1.0)
         self.knn_values.requires_grad_(False)
         self.config.knn.ply_path = str(self.knn_ply_path)
@@ -187,12 +244,6 @@ class TrajectoryTrainer:
             f"rendered threshold={self.config.knn.threshold:g})"
         )
 
-        if self.config.trajectory.camera_split == "train":
-            cameras = self.scene.getTrainCameras()
-        elif self.config.trajectory.camera_split == "test":
-            cameras = self.scene.getTestCameras()
-        else:
-            raise ValueError("trajectory.camera_split must be 'train' or 'test'")
         if not cameras:
             raise ValueError("The selected reference camera split is empty")
 
@@ -227,6 +278,32 @@ class TrajectoryTrainer:
             ),
             knn_threshold=self.config.knn.threshold,
         )
+
+    def shared_scene_context(self) -> TrajectorySceneContext:
+        return TrajectorySceneContext(
+            gaussians=self.gaussians,
+            scene=self.scene,
+            knn_ply_path=self.knn_ply_path,
+            knn_values=self.knn_values,
+            knn_tail_threshold=self.knn_tail_threshold,
+            reference_camera=self.reference_camera,
+            background=self.background,
+            renderer=self.renderer,
+        )
+
+    def _reuse_scene(self, context: TrajectorySceneContext) -> None:
+        self.gaussians = context.gaussians
+        self.scene = context.scene
+        self.knn_ply_path = context.knn_ply_path
+        self.knn_values = context.knn_values
+        self.knn_tail_threshold = context.knn_tail_threshold
+        self.reference_camera = context.reference_camera
+        self.background = context.background
+        self.renderer = context.renderer
+        self.config.knn.ply_path = str(self.knn_ply_path)
+        self.config.knn.tail_threshold = self.knn_tail_threshold
+        OmegaConf.save(self.config, self.output_dir / "config.yaml")
+        print(f"Reusing frozen Gaussian/KNN scene from {self.knn_ply_path}")
 
     def _resolve_knn_ply(self, model_iteration: int) -> Path:
         configured_path = self.config.knn.ply_path
@@ -459,7 +536,7 @@ class TrajectoryTrainer:
 
         renders = (
             self._render_previews()
-            if iteration % self.config.checkpoint.interval == 0
+            if iteration % self._preview_interval() == 0
             else None
         )
 
@@ -472,6 +549,15 @@ class TrajectoryTrainer:
         )
         self._log_iteration(losses, elapsed_ms)
         return {"renders": renders}, losses
+
+    def _preview_interval(self) -> int:
+        return int(
+            getattr(
+                self.config.checkpoint,
+                "preview_interval",
+                self.config.checkpoint.interval,
+            )
+        )
 
     def _log_iteration(self, losses, elapsed_ms: float) -> None:
         if self.wandb_run is None:
@@ -588,14 +674,17 @@ class TrajectoryTrainer:
                 forward_output, _ = self.run_train_iter(iteration)
                 progress.set_postfix(loss=f"{self.ema_loss:.6f}")
 
-                if iteration % self.config.checkpoint.interval == 0:
+                if forward_output["renders"] is not None:
                     self.save_previews(forward_output["renders"], iteration)
                 del forward_output
                 if (
                     iteration % self.config.checkpoint.interval == 0
                     and iteration != final_iteration
                 ):
-                    self.save_iteration_bundle(iteration)
+                    self.save_checkpoint(iteration)
+                    self.save_snapshot(iteration)
+                    if iteration % self._preview_interval() == 0:
+                        self.save_iteration_previews(iteration)
 
             # Normal completion always persists the final state exactly once,
             # independent of checkpoint interval and resume position.

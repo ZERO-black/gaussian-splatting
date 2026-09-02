@@ -1,0 +1,79 @@
+model:
+  # camera_json switches the trainer to standalone PLY mode.
+  source_path: null
+  model_path: ./models/church
+  camera_json: ./models/church/camera.json
+  znear: 0.1
+  zfar: 1000.0
+  iteration: 30000
+  sh_degree: 3
+  images: images
+  depths: ""
+  resolution: -1
+  white_background: false
+  train_test_exp: false
+  data_device: cuda
+  eval: false
+
+knn:
+  # Produce this once with:
+  # Generated from point_cloud/iteration_30000/point_cloud.ply.
+  ply_path: ./models/church/knn_analysis/iteration_30000/point_cloud_knn.ply
+  metric: mean
+  k: 10
+  tail_threshold: null
+  background: 1.0
+  normalize_by_camera_distance: true
+  multiply_by_splat_radius: false
+  threshold: 0.0
+
+trajectory:
+  path: ./cameras/church/navigation_0001.npz
+  # The generator already writes all interior optimizer waypoints.
+  intermediate_waypoints: 0
+  spline_control_points: 4
+  key: poses_c2w
+  direction_key: null
+  up: [0.0, 0.0, 1.0]
+  camera_split: train
+  reference_camera_index: 0
+
+optimization:
+  iterations: 200
+  # A/B remain fixed, while interior waypoints may move and rotate. The path
+  # regularizers below keep translation changes local and smooth.
+  translation_lr: 0.005
+  rotation_lr: 0.005
+
+loss:
+  knn_weight: 1000.0
+  photometric_weight: 0.0
+  translation_offset_weight: 100.0
+  rotation_offset_weight: 0.0
+  roll_weight: 10.0
+  acceleration_weight: 3000.0
+  tangent_weight: 10000.0
+  rotation_acceleration_weight: 1000.0
+
+checkpoint:
+  interval: 50
+  resume: null
+  intermediate_frames: 10
+  fps: 30
+  codec: mp4v
+
+logging:
+  wandb:
+    enabled: false
+    project: 3dgs-camera-gradient
+    entity: null
+    name: church-navigation-0001
+    mode: offline
+
+runtime:
+  device: cuda
+  quiet: false
+
+output:
+  directory: ./output/church_trajectory_train
+  run_name: navigation_forward_0001
