@@ -1,0 +1,46 @@
+model:
+  source_path: null
+  model_path: ./models/church
+  ply_path: ./models/church/point_cloud/iteration_30000/point_cloud.ply
+  camera_json: ./models/church/camera.json
+  znear: 0.1
+  zfar: 1000.0
+  iteration: 30000
+  sh_degree: 3
+  images: images
+  depths: ""
+  resolution: -1
+  white_background: false
+  train_test_exp: false
+  data_device: cuda
+  eval: false
+
+uncertainty:
+  enabled: false
+
+trajectory:
+  # Replaced with each navigation_XXXX.npz by the batch renderer.
+  path: ./cameras/church/random_100_v2/navigation_0001.npz
+  key: poses_c2w
+  direction_key: null
+  up: [0.0, 0.0, 1.0]
+  camera_split: train
+  reference_camera_index: 0
+  intermediate_frames: 10
+
+output:
+  directory: ./output/church_random_100_v2_render/unused
+  video_name: trajectory_rgb.mp4
+  fps: 30
+  codec: mp4v
+  save_video_frames: false
+
+batch:
+  input_dir: ./cameras/church/random_100_v2
+  input_glob: navigation_*.npz
+  expected_count: 100
+  output_dir: ./output/church_random_100_v2_render
+  manifest_filename: manifest.json
+  # A .render_complete marker is written only after the MP4 closes successfully.
+  skip_completed: true
+  continue_on_error: false

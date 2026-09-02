@@ -1,0 +1,36 @@
+model:
+  # Standalone model: no COLMAP/Blender source dataset is required.
+  source_path: null
+  model_path: ./models/church
+  ply_path: ./models/church/point_cloud/iteration_30000/point_cloud.ply
+  camera_json: ./models/church/camera.json
+  znear: 0.1
+  zfar: 1000.0
+  iteration: 30000
+  sh_degree: 3
+  images: images
+  depths: ""
+  resolution: -1
+  white_background: false
+  train_test_exp: false
+  data_device: cuda
+  eval: false
+
+uncertainty:
+  enabled: false
+
+trajectory:
+  path: ./cameras/church/navigation_0001.npz
+  key: poses_c2w
+  direction_key: null
+  up: [0.0, 0.0, 1.0]
+  camera_split: train
+  reference_camera_index: 0
+  intermediate_frames: 10
+
+output:
+  directory: ./output/church_forward_trajectory_render
+  video_name: navigation_0001.mp4
+  fps: 30
+  codec: mp4v
+  save_video_frames: false
