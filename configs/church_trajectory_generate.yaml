@@ -1,0 +1,63 @@
+seed: 0
+
+input:
+  # Use the exact per-Gaussian KNN metric, not KNN recomputed on a sparse subset.
+  ply_path: ./models/church/knn_analysis/iteration_30000/point_cloud_knn.ply
+  camera_json: ./models/church/camera.json
+  camera_index: 0
+
+# A deterministic subset keeps candidate search tractable for this 30M-Gaussian map.
+sample:
+  count: 120000
+  opacity_min: 0.05
+  max_scale_percentile: 99.9
+  knn_k: 10
+  sparsity_property: knn_mean_k10
+  sparsity_tail_threshold: 0.2363496571779251
+  sparsity_tail_percentile: 99.0
+  workers: -1
+
+path:
+  # Bounds are relative to the reference camera, never to an object/scene center.
+  xy_min: [-15.0, -15.0]
+  xy_max: [15.0, 15.0]
+  minimum_endpoint_distance: 6.0
+  maximum_endpoint_distance: 18.0
+  num_waypoints: 12
+  segment_candidates: 20
+  max_attempts: 10000
+
+collision:
+  # Every initial waypoint stays on one obstacle-free straight line.
+  segment_samples: 49
+  neighbor_count: 8
+  clearance: 1.0
+  scale_multiplier: 1.0
+  maximum_gaussian_radius: 0.25
+  minimum_ground_drop: 0.5
+  maximum_ground_drop: 3.0
+  ground_support_radius: 1.25
+  # Candidate discovery is sampled, but accepted paths are checked against all
+  # 30M Gaussians in one streaming pass before view selection.
+  exact_verification: true
+  exact_chunk_size: 500000
+
+view:
+  heading_count: 16
+  # Navigation cameras must keep looking generally along A -> B. This prevents
+  # the density objective from choosing a high-scoring backward-facing view.
+  maximum_heading_from_travel_degrees: 35.0
+  maximum_heading_change_degrees: 45.0
+  grid: [32, 18]
+  near: 0.1
+  far: 40.0
+  empty_cost: 1.0
+  minimum_coverage: 0.12
+  # A/B must be close to their locally best headings, while the interpolated
+  # interior must have a substantially better direction available.
+  endpoint_score_margin: 0.10
+  minimum_mean_improvement: 0.04
+  minimum_peak_improvement: 0.10
+
+output:
+  path: ./cameras/church/navigation_0001.npz

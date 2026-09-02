@@ -1,0 +1,74 @@
+# Generate 100 independent A -> B examples without touching navigation_0001.npz.
+defaults_note: Values below mirror church_trajectory_generate.yaml.
+
+seed: 0
+
+input:
+  ply_path: ./models/church/knn_analysis/iteration_30000/point_cloud_knn.ply
+  camera_json: ./models/church/camera.json
+  camera_index: 0
+
+sample:
+  count: 120000
+  opacity_min: 0.05
+  max_scale_percentile: 99.9
+  knn_k: 10
+  sparsity_property: knn_mean_k10
+  sparsity_tail_threshold: 0.2363496571779251
+  sparsity_tail_percentile: 99.0
+  workers: -1
+
+path:
+  xy_min: [-15.0, -15.0]
+  xy_max: [15.0, 15.0]
+  minimum_endpoint_distance: 6.0
+  maximum_endpoint_distance: 18.0
+  num_waypoints: 12
+  segment_candidates: 20
+  max_attempts: 10000
+
+collision:
+  segment_samples: 49
+  neighbor_count: 8
+  clearance: 1.0
+  scale_multiplier: 1.0
+  maximum_gaussian_radius: 0.25
+  minimum_ground_drop: 0.5
+  maximum_ground_drop: 3.0
+  ground_support_radius: 1.25
+  exact_verification: true
+  exact_chunk_size: 500000
+
+view:
+  # Uniformly sample from every scenario that passes the constraints. Selecting
+  # only the maximum score caused different seeds to converge to similar views.
+  selection: random
+  heading_count: 16
+  maximum_heading_from_travel_degrees: 35.0
+  maximum_heading_change_degrees: 45.0
+  grid: [32, 18]
+  near: 0.1
+  far: 40.0
+  empty_cost: 1.0
+  minimum_coverage: 0.12
+  endpoint_score_margin: 0.10
+  minimum_mean_improvement: 0.04
+  minimum_peak_improvement: 0.10
+
+# save_scenario expects this key; the batch script replaces it for every file.
+output:
+  path: ./cameras/church/random_100_v2/unused.npz
+
+batch:
+  count: 100
+  seed_start: 1000
+  start_index: 1
+  output_dir: ./cameras/church/random_100_v2
+  filename_format: navigation_{index:04d}.npz
+  summary_filename: summary.json
+  # Endpoint pairs closer than this are considered duplicate paths.
+  minimum_endpoint_pair_distance: 1.0
+  # More paths per batch reduce full-PLY I/O, but delay the first saved result.
+  exact_verification_batch_size: 10
+  max_candidate_attempts: 2000
+  overwrite: false
